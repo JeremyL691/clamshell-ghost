@@ -54,12 +54,19 @@ Hotplug evaluation in `EvaluateState()` is strictly staged to prevent auxiliary 
 - **Display Critical Path First**: Phase 1 of `EvaluateState()` handles only display topology evaluation, power assertion maintenance, and `CGVirtualDisplay` mounting or teardown.
 - **Decoupled Audio & Telemetry Maintenance**: Phase 2 operations—including CoreAudio HAL IPC (`UpdateDefaultAudioInputDevice`), `BlackHole 2ch` health verification, active wireless probing, and telemetry logging—are executed only after the display pipeline is fully settled.
 
-### 5. Lock-Free 48 kHz UDP PCM16 to `BlackHole 2ch` CoreAudio Bridge
+### 5. Unified Wired USB & Wireless UDP 48 kHz Audio Bridge with 5-Stage Speech-Clarity DSP
 
-In ESP32 Dock Mode, the daemon doubles as a low-latency wireless microphone receiver:
-- **Interactive-QoS UDP Socket (`StartUdpListener`)**: Binds to `0.0.0.0:18796` on a `QOS_CLASS_USER_INTERACTIVE` GCD dispatch source, parses `esp32_udp_hdr_t` packets (`magic = 0x4D323345`), replies with `ESP32_PKT_MAC_ACK_CTRL` keepalives, and writes incoming 48 kHz 16-bit mono PCM samples into a 16,384-sample lock-free atomic ring buffer (`g_pcmRingBuf`) using C11 acquire/release semantics.
-- **CoreAudio HAL Output Unit (`StartBlackHoleAudioBridge`)**: Locates `BlackHole 2ch` (`BlackHole2ch_UID`) via CoreAudio property queries, locks its nominal sample rate to `48000.0 Hz`, and attaches a real-time `kAudioUnitSubType_HALOutput` render callback (`BlackHoleRenderCallback`). The callback converts `int16_t` samples to stereo `Float32` frames, enforces a 20 ms prebuffer (`960` samples), and caps ring drift at 100 ms (`4800` samples -> `1920` target).
-- **Automatic Default Input Switching & Fallback Restoration (`UpdateDefaultAudioInputDevice`)**: Automatically switches `kAudioHardwarePropertyDefaultInputDevice` to `ESP32-S3 Dual Microphone` when connected over USB, or to `BlackHole 2ch` when streaming over Wi-Fi UDP. Prior to switching, it records the user's previous non-virtual input device (`g_savedFallbackInputID`, preferring built-in microphones) and restores it automatically when the ESP32 goes offline.
+In ESP32 Dock Mode (or whenever the ESP32 microphone is connected via USB or Wi-Fi), the daemon provides a unified, studio-grade 48 kHz DSP voice enhancement pipeline into `BlackHole 2ch`:
+- **Dual-Source Lossless Priority (`UsbMicInputIOProc` + `StartUdpListener`)**:
+  - **Wired USB Mode (Priority 1)**: When the ESP32 is plugged in via USB, `StartUsbMicCapture` binds a direct CoreAudio 48 kHz Input `IOProc` (`UsbMicInputIOProc`) to the `ESP32` UAC device, nudges USB input volume to `100%` (commanding the onboard ES7210 ADC to its maximum `37.5 dB` hardware PGA gain), and streams lossless 48 kHz PCM frames into the lock-free ring buffer (`30 ms` target latency). Simultaneously, active USB polling signals the ESP32 firmware (`usb_uac_active = true`) to pause 100 pkt/s Wi-Fi UDP audio transmission, eliminating 2.4 GHz RF switching noise on the analog microphone rail.
+  - **Wireless UDP Mode (Automatic Fallback)**: When unplugged from USB, the `QOS_CLASS_USER_INTERACTIVE` UDP listener (`0.0.0.0:18796`) receives 48 kHz PCM16 frames over Wi-Fi (`80 ms` jitter buffer with packet-loss linear interpolation).
+- **5-Stage Studio Speech-Clarity Biquad EQ & Far-Field AGC (`BlackHoleRenderCallback`)**:
+  1. **1-Pole DC Blocker + 2nd-Order Butterworth HPF (`95 Hz`)**: Eliminates DC offset, desk vibration, and 50/60 Hz mains hum while preserving natural vocal fundamental warmth (`110–200 Hz`).
+  2. **De-Mud Peaking Cut (`280 Hz`, `Q = 1.1`, `-3.5 dB`)**: Removes small-enclosure cavity resonance ("boxy/muffled" low-mids).
+  3. **Speech Presence & Consonant Articulation Boost (`3000 Hz`, `Q = 0.85`, `+6.0 dB`)**: Compensates for acoustic port roll-off across `1.6–5.4 kHz`, restoring consonant clarity (`s/sh/ch/t/k/p/f/x/q`) critical for Whisper, macOS Dictation, and voice assistants.
+  4. **2nd-Order Butterworth Anti-Hiss LPF (`9200 Hz`)**: Preserves crisp sibilant articulation up to `9.2 kHz` while filtering out `>10 kHz` Sigma-Delta modulator noise.
+  5. **Consonant-Safe Soft Expander (`150 ms` Hangover Hold) + Far-Field Voice AGC (`+24.1 dB` / `16x`) + Soft-Knee `tanhf` Limiter**: Uses a `<1 ms` attack and `150 ms` inter-syllable hold timer so soft leading consonants and word endings are never clipped, boosting desktop-distance speech to `-8 dBFS .. -4 dBFS` with zero hard clipping.
+- **Automatic Default Input Switching & Fallback Restoration (`UpdateDefaultAudioInputDevice`)**: Automatically switches `kAudioHardwarePropertyDefaultInputDevice` to `BlackHole 2ch` in both Wired USB and Wireless Wi-Fi modes so every macOS app receives the DSP-enhanced microphone stream, and restores the user's built-in microphone when the ESP32 goes offline.
 
 ---
 

@@ -155,23 +155,32 @@ static CFAbsoluteTime g_lastUdpAckTime = 0.0;
 static AudioDeviceID g_blackHoleDeviceID = kAudioObjectUnknown;
 static AudioDeviceIOProcID g_blackHoleIOProcID = NULL;
 static _Atomic bool g_blackHoleBridgeActive = false;
+static AudioDeviceID g_usbCaptureDeviceID = kAudioObjectUnknown;
+static AudioDeviceIOProcID g_usbCaptureIOProcID = NULL;
+static _Atomic bool g_usbCaptureActive = false;
+static _Atomic double g_lastUsbAudioPktTime = 0.0;
 static dispatch_queue_t g_audioBridgeQueue = nil;
 static _Atomic bool g_audioMaintenancePending = false;
 static _Atomic bool g_wantAudioUsbMic = false;
 static _Atomic bool g_wantAudioWifiMic = false;
 static BOOL g_pcmPrebuffering = YES;
 
-/* Adaptive fractional resampler + Broadcast Voice DSP state (CoreAudio render thread) */
+/* Adaptive fractional resampler + 5-Stage Speech-Clarity Broadcast Voice DSP state (CoreAudio render thread) */
 static double g_readFrac = 0.0;
 static float g_lastRenderedSample = 0.0f;
 static float g_dcPrevX = 0.0f;
 static float g_dcPrevY = 0.0f;
 static float g_hpfX1 = 0.0f, g_hpfX2 = 0.0f;
 static float g_hpfY1 = 0.0f, g_hpfY2 = 0.0f;
+static float g_demudX1 = 0.0f, g_demudX2 = 0.0f;
+static float g_demudY1 = 0.0f, g_demudY2 = 0.0f;
+static float g_presX1 = 0.0f, g_presX2 = 0.0f;
+static float g_presY1 = 0.0f, g_presY2 = 0.0f;
 static float g_lpfX1 = 0.0f, g_lpfX2 = 0.0f;
 static float g_lpfY1 = 0.0f, g_lpfY2 = 0.0f;
 static float g_envLevel = 0.0f;
-static float g_gateGainSmooth = 0.15f;
+static float g_gateGainSmooth = 3.2f;
+static uint32_t g_speechHoldSamples = 0;
 
 /* State tracking to avoid duplicate log spam */
 static int g_lastRealExtCount = -1;
@@ -671,13 +680,20 @@ static OSStatus BlackHoleRenderCallback(void *inRefCon,
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
     atomic_store_explicit(&g_lastBlackHoleRenderTime, now, memory_order_relaxed);
     CFAbsoluteTime lastAudio = atomic_load_explicit(&g_lastAudioPktTime, memory_order_relaxed);
+    CFAbsoluteTime lastUsbAudio = atomic_load_explicit(&g_lastUsbAudioPktTime, memory_order_relaxed);
+    BOOL usbStreamActive = (atomic_load_explicit(&g_usbCaptureActive, memory_order_relaxed) &&
+                            lastUsbAudio > 0.0 && (now - lastUsbAudio) < 0.5);
+    uint32_t targetLatency = usbStreamActive ? 1440U : PCM_TARGET_LATENCY_SAMPLES;
+    uint32_t prebufferSamples = usbStreamActive ? 960U : PCM_PREBUFFER_SAMPLES;
+    uint32_t maxLatency = usbStreamActive ? 3840U : PCM_MAX_LATENCY_SAMPLES;
+
     uint32_t w = atomic_load_explicit(&g_pcmWriteIdx, memory_order_acquire);
     uint32_t r = atomic_load_explicit(&g_pcmReadIdx, memory_order_relaxed);
     uint32_t avail = w - r;
 
-    if (avail > PCM_MAX_LATENCY_SAMPLES) {
-        r = w - PCM_TARGET_LATENCY_SAMPLES;
-        avail = PCM_TARGET_LATENCY_SAMPLES;
+    if (avail > maxLatency) {
+        r = w - targetLatency;
+        avail = targetLatency;
         g_readFrac = 0.0;
         atomic_store_explicit(&g_pcmReadIdx, r, memory_order_release);
         atomic_fetch_add_explicit(&g_bhOverruns, 1, memory_order_relaxed);
@@ -688,7 +704,7 @@ static OSStatus BlackHoleRenderCallback(void *inRefCon,
         g_pcmPrebuffering = YES;
         g_readFrac = 0.0;
     } else if (g_pcmPrebuffering) {
-        uint32_t minStart = (inNumberFrames + 16U > PCM_PREBUFFER_SAMPLES) ? (inNumberFrames + 16U) : PCM_PREBUFFER_SAMPLES;
+        uint32_t minStart = (inNumberFrames + 16U > prebufferSamples) ? (inNumberFrames + 16U) : prebufferSamples;
         if (avail >= minStart) {
             g_pcmPrebuffering = NO;
             g_readFrac = 0.0;
@@ -710,8 +726,8 @@ static OSStatus BlackHoleRenderCallback(void *inRefCon,
         return noErr;
     }
 
-    /* Proportional drift rate locking ring buffer fill to PCM_TARGET_LATENCY_SAMPLES (80ms) */
-    double err = (double)avail - (double)PCM_TARGET_LATENCY_SAMPLES;
+    /* Proportional drift rate locking ring buffer fill to targetLatency (30ms wired USB / 80ms wireless UDP) */
+    double err = (double)avail - (double)targetLatency;
     double drift = err * 0.0000008;
     if (drift > 0.003) drift = 0.003;
     if (drift < -0.003) drift = -0.003;
@@ -725,14 +741,21 @@ static OSStatus BlackHoleRenderCallback(void *inRefCon,
     double pos = g_readFrac;
     float frameOutPeak = 0.0f;
 
-    /* Biquad coefficients:
-     * Stage 1: 2nd-Order Butterworth HPF @ fc = 125 Hz, fs = 48000 Hz
-     * Stage 2: 2nd-Order Butterworth LPF @ fc = 7200 Hz, fs = 48000 Hz
+    /* 5-Stage Studio Speech-Clarity Biquad EQ Coefficients @ fs = 48000 Hz:
+     * Stage 1: 2nd-Order Butterworth HPF @ fc = 95 Hz (removes desk rumble & 50/60 Hz hum while keeping vocal warmth)
+     * Stage 2: De-Mud Peaking Cut @ fc = 280 Hz, Q = 1.1, Gain = -3.5 dB (removes enclosure cavity boxiness/mud)
+     * Stage 3: Speech Presence & Articulation Boost @ fc = 3000 Hz, Q = 0.85, Gain = +6.0 dB
+     *          (compensates for Waveshare 1.75C acoustic port roll-off across 1.6-5.4 kHz for crisp ASR consonant clarity)
+     * Stage 4: 2nd-Order Butterworth Anti-Hiss LPF @ fc = 9200 Hz (preserves sibilant clarity while cutting >10 kHz ADC noise)
      */
-    const float hpfB0 =  0.988512f, hpfB1 = -1.977024f, hpfB2 =  0.988512f;
-    const float hpfA1 = -1.976892f, hpfA2 =  0.977156f;
-    const float lpfB0 =  0.145324f, lpfB1 =  0.290648f, lpfB2 =  0.145324f;
-    const float lpfA1 = -0.671029f, lpfA2 =  0.252325f;
+    const float hpfB0   =  0.991245f, hpfB1   = -1.982491f, hpfB2   =  0.991245f;
+    const float hpfA1   = -1.982414f, hpfA2   =  0.982567f;
+    const float demudB0 =  0.993378f, demudB1 = -1.958749f, demudB2 =  0.966688f;
+    const float demudA1 = -1.958749f, demudA2 =  0.960066f;
+    const float presB0  =  1.136807f, presB1  = -1.593769f, presB2  =  0.588276f;
+    const float presA1  = -1.593769f, presA2  =  0.725083f;
+    const float lpfB0   =  0.193246f, lpfB1   =  0.386492f, lpfB2   =  0.193246f;
+    const float lpfA1   = -0.431732f, lpfA2   =  0.204717f;
 
     for (UInt32 i = 0; i < inNumberFrames; i++) {
         uint32_t idx = (uint32_t)pos;
@@ -749,7 +772,7 @@ static OSStatus BlackHoleRenderCallback(void *inRefCon,
         float x = s0 + (float)frac * (s1 - s0);
         pos += rate;
 
-        /* Stage 1: 1-pole DC Blocker + 2nd-Order Butterworth HPF @ 125 Hz (removes 50/60 Hz & 100 Hz Wi-Fi TX hum) */
+        /* Stage 1: 1-pole DC Blocker + 2nd-Order Butterworth HPF @ 95 Hz */
         float dcOut = x - g_dcPrevX + 0.995f * g_dcPrevY;
         g_dcPrevX = x;
         g_dcPrevY = dcOut;
@@ -761,35 +784,61 @@ static OSStatus BlackHoleRenderCallback(void *inRefCon,
         g_hpfY2 = g_hpfY1;
         g_hpfY1 = hpfOut;
 
-        /* Stage 2: 2nd-Order Butterworth LPF @ 7200 Hz (removes >7.5 kHz ADC/RF switching hiss) */
-        float y = lpfB0 * hpfOut + lpfB1 * g_lpfX1 + lpfB2 * g_lpfX2
+        /* Stage 2: 280 Hz De-Mud Cut (-3.5 dB) */
+        float demudOut = demudB0 * hpfOut + demudB1 * g_demudX1 + demudB2 * g_demudX2
+                       - demudA1 * g_demudY1 - demudA2 * g_demudY2;
+        g_demudX2 = g_demudX1;
+        g_demudX1 = hpfOut;
+        g_demudY2 = g_demudY1;
+        g_demudY1 = demudOut;
+
+        /* Stage 3: 3000 Hz Speech Presence & Consonant Articulation Boost (+6.0 dB) */
+        float presOut = presB0 * demudOut + presB1 * g_presX1 + presB2 * g_presX2
+                      - presA1 * g_presY1 - presA2 * g_presY2;
+        g_presX2 = g_presX1;
+        g_presX1 = demudOut;
+        g_presY2 = g_presY1;
+        g_presY1 = presOut;
+
+        /* Stage 4: 2nd-Order Butterworth LPF @ 9200 Hz */
+        float y = lpfB0 * presOut + lpfB1 * g_lpfX1 + lpfB2 * g_lpfX2
                 - lpfA1 * g_lpfY1 - lpfA2 * g_lpfY2;
         g_lpfX2 = g_lpfX1;
-        g_lpfX1 = hpfOut;
+        g_lpfX1 = presOut;
         g_lpfY2 = g_lpfY1;
         g_lpfY1 = y;
 
-        /* Stage 3: Smooth Envelope Downward Expander (Noise Gate) + Far-Field Voice AGC */
+        /* Stage 5: Consonant-Safe Soft Expander + 150ms Hangover Hold + Far-Field Voice AGC (+24 dB) */
         float absVal = fabsf(y);
-        float coeff = (absVal > g_envLevel) ? 0.015f : 0.00025f;
+        float coeff = (absVal > g_envLevel) ? 0.030f : 0.00014f;
         g_envLevel += coeff * (absVal - g_envLevel);
 
-        float targetGain;
-        if (g_envLevel < 0.0022f) {
-            /* Silent room floor: attenuate background hiss down to 0.08x (-22 dB) */
-            float t = g_envLevel / 0.0022f;
-            targetGain = 0.08f + 0.92f * (t * t);
-        } else {
-            /* Active speech: +21.5 dB (12.0x) far-field boost with smooth 2:1 AGC compression on loud peaks */
-            float speechNorm = (g_envLevel - 0.0022f) / 0.0030f;
-            if (speechNorm > 1.0f) speechNorm = 1.0f;
-            float agcBoost = 1.0f + 11.0f * speechNorm; /* ramps smoothly from 1.0x to 12.0x */
-            float agcComp = 1.0f / sqrtf(1.0f + g_envLevel * 20.0f);
-            targetGain = agcBoost * agcComp;
+        float speechTrigger = usbStreamActive ? 0.00095f : 0.00150f;
+        if (absVal > speechTrigger || g_envLevel > speechTrigger) {
+            g_speechHoldSamples = 7200U; /* 150ms hold @ 48kHz preserves inter-syllable & trailing consonants */
+        } else if (g_speechHoldSamples > 0) {
+            g_speechHoldSamples--;
         }
-        g_gateGainSmooth += 0.003f * (targetGain - g_gateGainSmooth);
 
-        /* Stage 4: Apply smoothed AGC/Gate Gain + Soft-Knee tanhf Limiter */
+        float restFloor = usbStreamActive ? 3.2f : 0.25f;
+        float targetGain;
+        if (g_speechHoldSamples == 0 && g_envLevel < speechTrigger) {
+            float t = g_envLevel / speechTrigger;
+            targetGain = restFloor + (6.0f - restFloor) * (t * t);
+        } else {
+            /* Active speech: +24.1 dB (16.0x) far-field boost with smooth AGC compression on loud speech */
+            float speechNorm = (g_envLevel - (speechTrigger * 0.5f)) / 0.0018f;
+            if (speechNorm < 0.0f) speechNorm = 0.0f;
+            if (speechNorm > 1.0f) speechNorm = 1.0f;
+            float agcBoost = 6.0f + 10.0f * speechNorm; /* ramps 6.0x -> 16.0x (+24.1 dB) */
+            float agcComp = 1.0f / sqrtf(1.0f + g_envLevel * 32.0f);
+            targetGain = agcBoost * agcComp;
+            if (targetGain < restFloor) targetGain = restFloor;
+        }
+        float gainRate = (targetGain > g_gateGainSmooth) ? 0.015f : 0.0005f;
+        g_gateGainSmooth += gainRate * (targetGain - g_gateGainSmooth);
+
+        /* Soft-Knee tanhf Limiter (ceiling 0.95 = -0.45 dBFS) */
         float boosted = y * g_gateGainSmooth;
         float outSample = 0.95f * tanhf(boosted / 0.95f);
         g_lastRenderedSample = outSample;
@@ -915,6 +964,157 @@ static void StopBlackHoleAudioBridge(void) {
     }
 }
 
+/* Direct 48kHz USB UAC CoreAudio Input Capture from 'ESP32' -> Ring Buffer -> 5-Stage Speech-Clarity DSP -> 'BlackHole 2ch' */
+static OSStatus UsbMicInputIOProc(AudioObjectID inDevice,
+                                  const AudioTimeStamp *inNow,
+                                  const AudioBufferList *inInputData,
+                                  const AudioTimeStamp *inInputTime,
+                                  AudioBufferList *outOutputData,
+                                  const AudioTimeStamp *inOutputTime,
+                                  void *inClientData) {
+    (void)inDevice;
+    (void)inNow;
+    (void)inInputTime;
+    (void)outOutputData;
+    (void)inOutputTime;
+    (void)inClientData;
+
+    if (!inInputData || inInputData->mNumberBuffers == 0) {
+        return noErr;
+    }
+    const AudioBuffer *b = &inInputData->mBuffers[0];
+    UInt32 ch = b->mNumberChannels;
+    if (ch == 0 || !b->mData) {
+        return noErr;
+    }
+    UInt32 frames = b->mDataByteSize / (ch * (UInt32)sizeof(float));
+    if (frames == 0) {
+        return noErr;
+    }
+    const float *p = (const float *)b->mData;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    atomic_store_explicit(&g_lastUsbAudioPktTime, now, memory_order_relaxed);
+    atomic_store_explicit(&g_lastAudioPktTime, now, memory_order_relaxed);
+
+    uint32_t w = atomic_load_explicit(&g_pcmWriteIdx, memory_order_relaxed);
+    uint32_t r = atomic_load_explicit(&g_pcmReadIdx, memory_order_acquire);
+    float maxAbs = 0.0f;
+
+    for (UInt32 i = 0; i < frames; i++) {
+        float f = p[i * ch];
+        if (f > 1.0f) f = 1.0f;
+        else if (f < -1.0f) f = -1.0f;
+        float a = fabsf(f);
+        if (a > maxAbs) {
+            maxAbs = a;
+        }
+        int32_t s32 = (int32_t)lrintf(f * 32767.0f);
+        if (s32 > 32767) s32 = 32767;
+        else if (s32 < -32768) s32 = -32768;
+        g_pcmRingBuf[(w + i) & PCM_RING_MASK] = (int16_t)s32;
+    }
+    w += frames;
+    atomic_store_explicit(&g_pcmWriteIdx, w, memory_order_release);
+
+    float prevRawPeak = atomic_load_explicit(&g_pcmRawPeak, memory_order_relaxed);
+    float nextRawPeak = fmaxf(maxAbs, prevRawPeak * 0.985f);
+    atomic_store_explicit(&g_pcmRawPeak, nextRawPeak, memory_order_relaxed);
+
+    if (!atomic_load_explicit(&g_blackHoleBridgeActive, memory_order_relaxed)) {
+        if ((uint32_t)(w - r) > 3840U) {
+            atomic_store_explicit(&g_pcmReadIdx, w - 1440U, memory_order_release);
+        }
+    }
+    return noErr;
+}
+
+static void StopUsbMicCapture(void) {
+    atomic_store_explicit(&g_usbCaptureActive, false, memory_order_release);
+    if (g_usbCaptureIOProcID != NULL && g_usbCaptureDeviceID != kAudioObjectUnknown) {
+        AudioDeviceStop(g_usbCaptureDeviceID, g_usbCaptureIOProcID);
+        AudioDeviceDestroyIOProcID(g_usbCaptureDeviceID, g_usbCaptureIOProcID);
+        g_usbCaptureIOProcID = NULL;
+        g_usbCaptureDeviceID = kAudioObjectUnknown;
+    }
+}
+
+static BOOL StartUsbMicCapture(void) {
+    AudioDeviceID usbID = FindEsp32UsbAudioDeviceID();
+    if (usbID == kAudioObjectUnknown) {
+        StopUsbMicCapture();
+        return NO;
+    }
+    if (atomic_load_explicit(&g_usbCaptureActive, memory_order_relaxed) &&
+        g_usbCaptureIOProcID != NULL &&
+        g_usbCaptureDeviceID == usbID) {
+        double lastUsb = atomic_load_explicit(&g_lastUsbAudioPktTime, memory_order_relaxed);
+        if (lastUsb > 0.0 && (CFAbsoluteTimeGetCurrent() - lastUsb) < 3.0) {
+            return YES;
+        }
+        StopUsbMicCapture();
+    } else if (g_usbCaptureIOProcID != NULL) {
+        StopUsbMicCapture();
+    }
+
+    Float64 nominalRate = 0.0;
+    UInt32 rateSize = sizeof(Float64);
+    AudioObjectPropertyAddress rateAddr = {
+        kAudioDevicePropertyNominalSampleRate,
+        kAudioObjectPropertyScopeGlobal,
+        0
+    };
+    if (AudioObjectGetPropertyData(usbID, &rateAddr, 0, NULL, &rateSize, &nominalRate) == noErr && nominalRate != 48000.0) {
+        Float64 targetRate = 48000.0;
+        AudioObjectSetPropertyData(usbID, &rateAddr, 0, NULL, sizeof(Float64), &targetRate);
+    }
+
+    /* Unmute and nudge USB UAC input volume scalar (0.98 -> 1.00) so ESP32 uac_set_volume_cb(100)
+     * drives ES7210 hardware PGA gain to maximum Step 14 (37.5 dB). */
+    for (UInt32 elem = 0; elem <= 2; elem++) {
+        AudioObjectPropertyAddress muteAddr = {
+            kAudioDevicePropertyMute,
+            kAudioObjectPropertyScopeInput,
+            elem
+        };
+        if (AudioObjectHasProperty(usbID, &muteAddr)) {
+            UInt32 mute = 0;
+            AudioObjectSetPropertyData(usbID, &muteAddr, 0, NULL, sizeof(UInt32), &mute);
+        }
+        AudioObjectPropertyAddress volAddr = {
+            kAudioDevicePropertyVolumeScalar,
+            kAudioObjectPropertyScopeInput,
+            elem
+        };
+        if (AudioObjectHasProperty(usbID, &volAddr)) {
+            Float32 nudge = 0.98f;
+            AudioObjectSetPropertyData(usbID, &volAddr, 0, NULL, sizeof(Float32), &nudge);
+            Float32 fullVol = 1.0f;
+            AudioObjectSetPropertyData(usbID, &volAddr, 0, NULL, sizeof(Float32), &fullVol);
+        }
+    }
+
+    AudioDeviceIOProcID procID = NULL;
+    if (AudioDeviceCreateIOProcID(usbID, UsbMicInputIOProc, NULL, &procID) != noErr || procID == NULL) {
+        return NO;
+    }
+    g_usbCaptureDeviceID = usbID;
+    g_usbCaptureIOProcID = procID;
+    atomic_store_explicit(&g_lastUsbAudioPktTime, CFAbsoluteTimeGetCurrent(), memory_order_relaxed);
+    atomic_store_explicit(&g_usbCaptureActive, true, memory_order_release);
+
+    if (AudioDeviceStart(usbID, procID) != noErr) {
+        atomic_store_explicit(&g_usbCaptureActive, false, memory_order_release);
+        g_usbCaptureIOProcID = NULL;
+        g_usbCaptureDeviceID = kAudioObjectUnknown;
+        AudioDeviceDestroyIOProcID(usbID, procID);
+        return NO;
+    }
+
+    LogMsg(@"USB AUDIO CAPTURE: CoreAudio 48kHz Input IOProc bound to 'ESP32' (AudioDeviceID=%u) -> Speech-Clarity DSP -> 'BlackHole 2ch'",
+           (unsigned int)usbID);
+    return YES;
+}
+
 static AudioDeviceID g_savedFallbackInputID = kAudioObjectUnknown;
 
 /* Only allow Built-In (MacBook Pro Microphone) or physical USB microphones as fallback;
@@ -992,16 +1192,19 @@ static void UpdateDefaultAudioInputDevice(BOOL usbMic, BOOL wirelessMic) {
         g_savedFallbackInputID = curInID;
     }
 
-    if (!usbMic && wirelessMic) {
-        if (bhID != kAudioObjectUnknown && curInID != bhID) {
-            if (AudioObjectSetPropertyData(kAudioObjectSystemObject, &defInAddr, 0, NULL, sizeof(AudioDeviceID), &bhID) == noErr) {
-                LogMsg(@"Switched macOS Default Input Device to 'BlackHole 2ch' (ESP32 Wireless 48kHz Audio)");
+    if (usbMic || wirelessMic) {
+        /* Route both Wired USB and Wireless Wi-Fi modes through 'BlackHole 2ch' so macOS apps always
+         * receive the 5-Stage Speech-Clarity DSP + Far-Field AGC enhanced stream (with lossless USB taking priority). */
+        if (bhID != kAudioObjectUnknown && atomic_load_explicit(&g_blackHoleBridgeActive, memory_order_relaxed)) {
+            if (curInID != bhID) {
+                if (AudioObjectSetPropertyData(kAudioObjectSystemObject, &defInAddr, 0, NULL, sizeof(AudioDeviceID), &bhID) == noErr) {
+                    LogMsg(@"Switched macOS Default Input Device to 'BlackHole 2ch' (%@ 48kHz + Speech-Clarity DSP)",
+                           usbMic ? @"ESP32 USB Wired" : @"ESP32 Wireless");
+                }
             }
-        }
-    } else if (usbMic) {
-        if (usbAudioID != kAudioObjectUnknown && curInID != usbAudioID) {
+        } else if (usbMic && usbAudioID != kAudioObjectUnknown && curInID != usbAudioID) {
             if (AudioObjectSetPropertyData(kAudioObjectSystemObject, &defInAddr, 0, NULL, sizeof(AudioDeviceID), &usbAudioID) == noErr) {
-                LogMsg(@"Switched macOS Default Input Device to 'ESP32-S3 Dual Microphone' (USB Wired 48kHz Audio)");
+                LogMsg(@"Switched macOS Default Input Device to 'ESP32-S3 Dual Microphone' (USB Wired 48kHz Raw Fallback)");
             }
         }
     } else {
@@ -1115,7 +1318,11 @@ static BOOL StartUdpListener(void) {
                 g_lastUdpAckTime = now;
             }
 
-            if (hdr->pkt_type == ESP32_PKT_AUDIO_PCM16 && hdr->sample_cnt > 0) {
+            CFAbsoluteTime lastUsbAudio = atomic_load_explicit(&g_lastUsbAudioPktTime, memory_order_relaxed);
+            BOOL usbStreamActive = (atomic_load_explicit(&g_usbCaptureActive, memory_order_relaxed) &&
+                                    lastUsbAudio > 0.0 && (now - lastUsbAudio) < 0.5);
+
+            if (!usbStreamActive && hdr->pkt_type == ESP32_PKT_AUDIO_PCM16 && hdr->sample_cnt > 0) {
                 size_t expectedBytes = sizeof(esp32_udp_hdr_t) + (size_t)hdr->sample_cnt * sizeof(int16_t);
                 if ((size_t)n >= expectedBytes) {
                     const int16_t *samples = (const int16_t *)(pktBuf + sizeof(esp32_udp_hdr_t));
@@ -1762,7 +1969,7 @@ static void EvaluateState(NSString *trigger) {
          * (StartBlackHoleAudioBridge / StopBlackHoleAudioBridge / UpdateDefaultAudioInputDevice)
          * is offloaded to g_audioBridgeQueue so a slow or wedged coreaudiod driver during
          * DisplayPort/HDMI hotplug can NEVER block the main display/power runloop thread. */
-        if (!wirelessMicPresent) {
+        if (!usbMicPresent && !wirelessMicPresent) {
             atomic_store_explicit(&g_pcmRawPeak, 0.0f, memory_order_relaxed);
             atomic_store_explicit(&g_pcmOutPeak, 0.0f, memory_order_relaxed);
         }
@@ -1784,6 +1991,12 @@ static void EvaluateState(NSString *trigger) {
                     BOOL usbMic = (BOOL)atomic_load_explicit(&g_wantAudioUsbMic, memory_order_relaxed);
                     BOOL wifiMic = (BOOL)atomic_load_explicit(&g_wantAudioWifiMic, memory_order_relaxed);
                     CFAbsoluteTime nowAudio = CFAbsoluteTimeGetCurrent();
+
+                    if (usbMic) {
+                        StartUsbMicCapture();
+                    } else {
+                        StopUsbMicCapture();
+                    }
 
                     if (atomic_load_explicit(&g_blackHoleBridgeActive, memory_order_relaxed)) {
                         double lastRender = atomic_load_explicit(&g_lastBlackHoleRenderTime, memory_order_relaxed);
@@ -1998,6 +2211,7 @@ static void RegisterSignalHandlers(void) {
                                 if (!wirelessStillActive) {
                                     UpdateDefaultAudioInputDevice(NO, NO);
                                 }
+                                StopUsbMicCapture();
                                 StopBlackHoleAudioBridge();
                                 dispatch_semaphore_signal(doneSem);
                             }

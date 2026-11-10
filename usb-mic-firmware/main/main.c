@@ -53,8 +53,8 @@ static const char *TAG = "usb_mic_175c";
 #define BOOT_BUTTON_GPIO        GPIO_NUM_0
 
 #define MIC_SAMPLE_RATE         CONFIG_UAC_SAMPLE_RATE
-/* Default ES7210 PGA hardware gain step: 12 = 34.5 dB (range 0..14 => 0..37.5 dB) */
-#define MIC_DEFAULT_GAIN_STEP   12
+/* Default ES7210 PGA hardware gain step: 14 = 37.5 dB maximum hardware gain (range 0..14 => 0..37.5 dB) */
+#define MIC_DEFAULT_GAIN_STEP   14
 
 /* UDP Dual-Mode Audio & Heartbeat Protocol */
 #define ESP32_UDP_PORT          18796
@@ -316,10 +316,9 @@ static void mix_stereo_to_mono(const int16_t *src, int16_t *dst, size_t mono_sam
     for (size_t i = 0; i < mono_samples; i++) {
         int32_t m1 = src[2 * i];
         int32_t m2 = src[2 * i + 1];
-        /* Combine dual microphones with 0.75x headroom scaling ((3 * (m1 + m2)) >> 2)
-         * to preserve +3dB dual-mic SNR gain while preventing premature hard clipping on loud speech. */
-        int32_t sum = m1 + m2;
-        int32_t mixed = (sum * 3) >> 2;
+        /* Sum dual microphones directly (m1 + m2) for full +6 dB coherent signal gain (+3 dB SNR improvement)
+         * with saturation clamp to maximize native 16-bit dynamic range before host DSP. */
+        int32_t mixed = m1 + m2;
         if (mixed > 32767) {
             mixed = 32767;
         } else if (mixed < -32768) {
