@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.waveshare.esp32-smart-dummy</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__BIN_PATH__</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/tmp</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>StandardOutPath</key>
+    <string>/tmp/esp32-smart-dummy.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/esp32-smart-dummy.log</string>
+</dict>
+</plist>

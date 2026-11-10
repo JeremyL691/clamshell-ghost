@@ -1,0 +1,24 @@
+# Secrets and binary images
+secrets/
+*.key
+*.env
+*.bin
+*.zip
+
+# Python caches
+**/__pycache__/
+**/.pytest_cache/
+
+# ESP-IDF build artifacts for USB/Wi-Fi microphone firmware
+usb-mic-firmware/build/
+usb-mic-firmware/managed_components/
+usb-mic-firmware/sdkconfig
+usb-mic-firmware/sdkconfig.old
+usb-mic-firmware/dependencies.lock
+
+# macOS Smart Dummy Display daemon build & runtime logs
+mac-smart-dummy/esp32-smart-dummy
+mac-smart-dummy/*.log
+
+# macOS metadata
+.DS_Store

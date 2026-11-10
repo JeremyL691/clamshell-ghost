@@ -1,0 +1,27 @@
+menu "Clamshell Ghost ESP32 Microphone Configuration"
+
+    config ESP32_WIFI_SSID
+        string "Fallback Wi-Fi SSID"
+        default ""
+        help
+            Fallback Wi-Fi SSID for station mode.
+            Credentials stored in the NVS "wifi" namespace ("ssid"/"password" or
+            "ssid0"/"password0") or standard ESP-IDF Wi-Fi NVS take priority.
+            This Kconfig value is used only when NVS has no stored credentials.
+
+    config ESP32_WIFI_PASSWORD
+        string "Fallback Wi-Fi Password"
+        default ""
+        help
+            Fallback Wi-Fi password corresponding to CONFIG_ESP32_WIFI_SSID.
+
+    config ESP32_DEFAULT_MAC_IP
+        string "Initial Target Mac IPv4 Address"
+        default "255.255.255.255"
+        help
+            Initial destination IPv4 address for UDP audio and heartbeat packets on
+            port 18796 before Mac discovery completes. The ESP32 automatically
+            discovers the Mac via UDP broadcast on port 18796 and locks onto the
+            Mac's unicast IP as soon as a MAC_ACK_CTRL packet is received.
+
+endmenu
