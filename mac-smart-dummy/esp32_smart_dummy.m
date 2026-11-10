@@ -116,7 +116,7 @@ static BOOL g_clamshellStayAwakeActive = NO;
 static BOOL g_forceCreateForTest = NO;
 static BOOL g_simulateZeroRealMonitors = NO;
 static BOOL g_isDaemonMode = NO;
-static BOOL g_standaloneMode = NO;
+static BOOL g_standaloneMode = YES;
 static unsigned int g_targetWidth = 1600;
 static unsigned int g_targetHeight = 1000;
 static dispatch_source_t g_evalTimer = nil;
@@ -1685,8 +1685,9 @@ static void PrintUsage(const char *progName) {
            "Options:\n"
            "  --status              Print current power, display, audio bridge, and daemon state and exit\n"
            "  --probe-wireless      Print wireless ESP32 UDP presence and IP address and exit\n"
-           "  --standalone          Run in standalone Mac-only mode (activate on AC power without ESP32 hardware;\n"
-           "                        can also be enabled via environment variable CLAMSHELL_STANDALONE=1)\n"
+           "  --standalone          Activate virtual display & stay-awake on AC power without requiring\n"
+           "                        ESP32 hardware presence (default; ESP32 still acts as wireless/USB mic)\n"
+           "  --require-esp32       Only activate virtual display & stay-awake when ESP32 is online\n"
            "  --resolution <WxH>    Set logical HiDPI resolution in range 800..3840 x 600..2400 (default: 1600x1000,\n"
            "                        backed by a 2x Retina framebuffer, e.g. 3200x2000)\n"
            "  --test-create         Force virtual display creation and stay-awake assertions for testing\n"
@@ -1697,10 +1698,14 @@ static void PrintUsage(const char *progName) {
 int main(int argc, const char * argv[]) {
     @autoreleasepool {
         const char *envStandalone = getenv("CLAMSHELL_STANDALONE");
-        if (envStandalone && (strcmp(envStandalone, "1") == 0 ||
-                              strcasecmp(envStandalone, "true") == 0 ||
-                              strcasecmp(envStandalone, "yes") == 0)) {
-            g_standaloneMode = YES;
+        if (envStandalone) {
+            if (strcmp(envStandalone, "0") == 0 ||
+                strcasecmp(envStandalone, "false") == 0 ||
+                strcasecmp(envStandalone, "no") == 0) {
+                g_standaloneMode = NO;
+            } else {
+                g_standaloneMode = YES;
+            }
         }
 
         BOOL oneShotStatus = NO;
@@ -1711,6 +1716,8 @@ int main(int argc, const char * argv[]) {
                 return 0;
             } else if (strcmp(argv[i], "--standalone") == 0) {
                 g_standaloneMode = YES;
+            } else if (strcmp(argv[i], "--require-esp32") == 0) {
+                g_standaloneMode = NO;
             } else if (strcmp(argv[i], "--resolution") == 0) {
                 if (i + 1 >= argc) {
                     fprintf(stderr, "Error: --resolution requires a <W>x<H> argument (800..3840 x 600..2400)\n");
