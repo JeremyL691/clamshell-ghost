@@ -152,8 +152,13 @@ static dispatch_queue_t g_udpQueue = nil;
 static dispatch_source_t g_udpReadSource = nil;
 static CFAbsoluteTime g_lastUdpAckTime = 0.0;
 
-static AudioComponentInstance g_blackHoleAudioUnit = NULL;
+static AudioDeviceID g_blackHoleDeviceID = kAudioObjectUnknown;
+static AudioDeviceIOProcID g_blackHoleIOProcID = NULL;
 static _Atomic bool g_blackHoleBridgeActive = false;
+static dispatch_queue_t g_audioBridgeQueue = nil;
+static _Atomic bool g_audioMaintenancePending = false;
+static _Atomic bool g_wantAudioUsbMic = false;
+static _Atomic bool g_wantAudioWifiMic = false;
 static BOOL g_pcmPrebuffering = YES;
 
 /* Adaptive fractional resampler + Broadcast Voice DSP state (CoreAudio render thread) */
@@ -187,15 +192,19 @@ static void LogMsg(NSString *fmt, ...) {
         NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:args];
         va_end(args);
         static NSDateFormatter *df = nil;
+        static os_unfair_lock s_logLock = OS_UNFAIR_LOCK_INIT;
         static dispatch_once_t onceToken;
         dispatch_once(&onceToken, ^{
             df = [[NSDateFormatter alloc] init];
             [df setDateFormat:@"yyyy-MM-dd HH:mm:ss.SSS"];
         });
+        os_unfair_lock_lock(&s_logLock);
+        NSString *ts = [df stringFromDate:[NSDate date]];
         fprintf(stdout, "[%s] [esp32-smart-dummy] %s\n",
-                [[df stringFromDate:[NSDate date]] UTF8String],
+                [ts UTF8String],
                 [msg UTF8String]);
         fflush(stdout);
+        os_unfair_lock_unlock(&s_logLock);
     }
 }
 
@@ -520,6 +529,23 @@ static AudioDeviceID FindBlackHoleDeviceID(void) {
     return foundID;
 }
 
+static UInt32 GetAudioDeviceTransportType(AudioDeviceID devID) {
+    if (devID == kAudioObjectUnknown) {
+        return 0;
+    }
+    UInt32 transport = 0;
+    UInt32 tSize = sizeof(UInt32);
+    AudioObjectPropertyAddress tAddr = {
+        kAudioDevicePropertyTransportType,
+        kAudioObjectPropertyScopeGlobal,
+        0
+    };
+    if (AudioObjectGetPropertyData(devID, &tAddr, 0, NULL, &tSize, &transport) == noErr) {
+        return transport;
+    }
+    return 0;
+}
+
 static AudioDeviceID FindEsp32UsbAudioDeviceID(void) {
     AudioObjectPropertyAddress propAddr = {
         kAudioHardwarePropertyDevices,
@@ -538,6 +564,11 @@ static AudioDeviceID FindEsp32UsbAudioDeviceID(void) {
     AudioDeviceID foundID = kAudioObjectUnknown;
     if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &propAddr, 0, NULL, &dataSize, devices) == noErr) {
         for (UInt32 i = 0; i < deviceCount; i++) {
+            /* Check transport type FIRST so we never query kAudioDevicePropertyStreamConfiguration
+             * on Continuity Camera ('ccwd'), DisplayPort ('dprt'), or Virtual ('virt') devices. */
+            if (GetAudioDeviceTransportType(devices[i]) != kAudioDeviceTransportTypeUSB) {
+                continue;
+            }
             if (GetAudioDeviceChannelCount(devices[i], kAudioObjectPropertyScopeInput) == 0) {
                 continue;
             }
@@ -783,8 +814,30 @@ static OSStatus BlackHoleRenderCallback(void *inRefCon,
     return noErr;
 }
 
+static OSStatus BlackHoleIOProc(AudioObjectID inDevice,
+                                const AudioTimeStamp *inNow,
+                                const AudioBufferList *inInputData,
+                                const AudioTimeStamp *inInputTime,
+                                AudioBufferList *outOutputData,
+                                const AudioTimeStamp *inOutputTime,
+                                void *inClientData) {
+    (void)inDevice;
+    (void)inNow;
+    (void)inInputData;
+    (void)inInputTime;
+    if (!outOutputData || outOutputData->mNumberBuffers == 0) {
+        return noErr;
+    }
+    UInt32 ch = outOutputData->mBuffers[0].mNumberChannels;
+    if (ch == 0) {
+        return noErr;
+    }
+    UInt32 frames = outOutputData->mBuffers[0].mDataByteSize / (ch * (UInt32)sizeof(float));
+    return BlackHoleRenderCallback(inClientData, NULL, inOutputTime, 0, frames, outOutputData);
+}
+
 static BOOL StartBlackHoleAudioBridge(void) {
-    if (atomic_load_explicit(&g_blackHoleBridgeActive, memory_order_relaxed) && g_blackHoleAudioUnit != NULL) {
+    if (atomic_load_explicit(&g_blackHoleBridgeActive, memory_order_relaxed) && g_blackHoleIOProcID != NULL) {
         return YES;
     }
     AudioDeviceID bhID = FindBlackHoleDeviceID();
@@ -830,72 +883,21 @@ static BOOL StartBlackHoleAudioBridge(void) {
         }
     }
 
-    AudioComponentDescription desc = {
-        .componentType = kAudioUnitType_Output,
-        .componentSubType = kAudioUnitSubType_HALOutput,
-        .componentManufacturer = kAudioUnitManufacturer_Apple,
-        .componentFlags = 0,
-        .componentFlagsMask = 0
-    };
-    AudioComponent comp = AudioComponentFindNext(NULL, &desc);
-    if (!comp) {
-        return NO;
-    }
-    AudioComponentInstance au = NULL;
-    if (AudioComponentInstanceNew(comp, &au) != noErr || !au) {
+    AudioDeviceIOProcID procID = NULL;
+    if (AudioDeviceCreateIOProcID(bhID, BlackHoleIOProc, NULL, &procID) != noErr || procID == NULL) {
         return NO;
     }
 
-    UInt32 enableOutput = 1;
-    if (AudioUnitSetProperty(au, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Output, 0, &enableOutput, sizeof(enableOutput)) != noErr) {
-        AudioComponentInstanceDispose(au);
-        return NO;
-    }
-    UInt32 disableInput = 0;
-    AudioUnitSetProperty(au, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Input, 1, &disableInput, sizeof(disableInput));
-
-    if (AudioUnitSetProperty(au, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &bhID, sizeof(bhID)) != noErr) {
-        AudioComponentInstanceDispose(au);
-        return NO;
-    }
-
-    AudioStreamBasicDescription streamFmt = {0};
-    streamFmt.mSampleRate = 48000.0;
-    streamFmt.mFormatID = kAudioFormatLinearPCM;
-    streamFmt.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
-    streamFmt.mFramesPerPacket = 1;
-    streamFmt.mChannelsPerFrame = 2;
-    streamFmt.mBitsPerChannel = 32;
-    streamFmt.mBytesPerPacket = 8;
-    streamFmt.mBytesPerFrame = 8;
-    if (AudioUnitSetProperty(au, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &streamFmt, sizeof(streamFmt)) != noErr) {
-        AudioComponentInstanceDispose(au);
-        return NO;
-    }
-
-    AURenderCallbackStruct cb = {
-        .inputProc = BlackHoleRenderCallback,
-        .inputProcRefCon = NULL
-    };
-    if (AudioUnitSetProperty(au, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0, &cb, sizeof(cb)) != noErr) {
-        AudioComponentInstanceDispose(au);
-        return NO;
-    }
-
-    if (AudioUnitInitialize(au) != noErr) {
-        AudioComponentInstanceDispose(au);
-        return NO;
-    }
-
-    g_blackHoleAudioUnit = au;
+    g_blackHoleDeviceID = bhID;
+    g_blackHoleIOProcID = procID;
     atomic_store_explicit(&g_lastBlackHoleRenderTime, CFAbsoluteTimeGetCurrent(), memory_order_relaxed);
     atomic_store_explicit(&g_blackHoleBridgeActive, true, memory_order_release);
 
-    if (AudioOutputUnitStart(au) != noErr) {
+    if (AudioDeviceStart(bhID, procID) != noErr) {
         atomic_store_explicit(&g_blackHoleBridgeActive, false, memory_order_release);
-        g_blackHoleAudioUnit = NULL;
-        AudioUnitUninitialize(au);
-        AudioComponentInstanceDispose(au);
+        g_blackHoleIOProcID = NULL;
+        g_blackHoleDeviceID = kAudioObjectUnknown;
+        AudioDeviceDestroyIOProcID(bhID, procID);
         return NO;
     }
 
@@ -905,45 +907,31 @@ static BOOL StartBlackHoleAudioBridge(void) {
 
 static void StopBlackHoleAudioBridge(void) {
     atomic_store_explicit(&g_blackHoleBridgeActive, false, memory_order_release);
-    if (g_blackHoleAudioUnit != NULL) {
-        AudioOutputUnitStop(g_blackHoleAudioUnit);
-        AudioUnitUninitialize(g_blackHoleAudioUnit);
-        AudioComponentInstanceDispose(g_blackHoleAudioUnit);
-        g_blackHoleAudioUnit = NULL;
+    if (g_blackHoleIOProcID != NULL && g_blackHoleDeviceID != kAudioObjectUnknown) {
+        AudioDeviceStop(g_blackHoleDeviceID, g_blackHoleIOProcID);
+        AudioDeviceDestroyIOProcID(g_blackHoleDeviceID, g_blackHoleIOProcID);
+        g_blackHoleIOProcID = NULL;
+        g_blackHoleDeviceID = kAudioObjectUnknown;
     }
 }
 
 static AudioDeviceID g_savedFallbackInputID = kAudioObjectUnknown;
 
-static UInt32 GetAudioDeviceTransportType(AudioDeviceID devID) {
-    if (devID == kAudioObjectUnknown) {
-        return 0;
-    }
-    UInt32 transport = 0;
-    UInt32 tSize = sizeof(UInt32);
-    AudioObjectPropertyAddress tAddr = {
-        kAudioDevicePropertyTransportType,
-        kAudioObjectPropertyScopeGlobal,
-        0
-    };
-    if (AudioObjectGetPropertyData(devID, &tAddr, 0, NULL, &tSize, &transport) == noErr) {
-        return transport;
-    }
-    return 0;
-}
-
 /* Only allow Built-In (MacBook Pro Microphone) or physical USB microphones as fallback;
- * never select Continuity Camera / iPhone Microphone (Transport=Unknown/0) or Virtual devices. */
+ * never select Continuity Camera / iPhone Microphone ('ccwd') or Virtual devices ('virt'). */
 static BOOL IsAllowedFallbackInputDevice(AudioDeviceID devID, AudioDeviceID bhID, AudioDeviceID usbAudioID) {
     if (devID == kAudioObjectUnknown || devID == bhID || devID == usbAudioID) {
+        return NO;
+    }
+    UInt32 transport = GetAudioDeviceTransportType(devID);
+    if (transport != kAudioDeviceTransportTypeBuiltIn &&
+        transport != kAudioDeviceTransportTypeUSB) {
         return NO;
     }
     if (GetAudioDeviceChannelCount(devID, kAudioObjectPropertyScopeInput) == 0) {
         return NO;
     }
-    UInt32 transport = GetAudioDeviceTransportType(devID);
-    return (transport == kAudioDeviceTransportTypeBuiltIn ||
-            transport == kAudioDeviceTransportTypeUSB);
+    return YES;
 }
 
 static AudioDeviceID FindFallbackInputDeviceID(AudioDeviceID bhID, AudioDeviceID usbAudioID) {
@@ -998,7 +986,7 @@ static void UpdateDefaultAudioInputDevice(BOOL usbMic, BOOL wirelessMic) {
     AudioObjectGetPropertyData(kAudioObjectSystemObject, &defInAddr, 0, NULL, &propSize, &curInID);
 
     AudioDeviceID bhID = FindBlackHoleDeviceID();
-    AudioDeviceID usbAudioID = FindEsp32UsbAudioDeviceID();
+    AudioDeviceID usbAudioID = usbMic ? FindEsp32UsbAudioDeviceID() : kAudioObjectUnknown;
 
     if (IsAllowedFallbackInputDevice(curInID, bhID, usbAudioID)) {
         g_savedFallbackInputID = curInID;
@@ -1127,10 +1115,7 @@ static BOOL StartUdpListener(void) {
                 g_lastUdpAckTime = now;
             }
 
-            if (hdr->pkt_type == ESP32_PKT_HEARTBEAT) {
-                g_lastUdpSeq = hdr->seq;
-                g_hasLastUdpSeq = YES;
-            } else if (hdr->pkt_type == ESP32_PKT_AUDIO_PCM16 && hdr->sample_cnt > 0) {
+            if (hdr->pkt_type == ESP32_PKT_AUDIO_PCM16 && hdr->sample_cnt > 0) {
                 size_t expectedBytes = sizeof(esp32_udp_hdr_t) + (size_t)hdr->sample_cnt * sizeof(int16_t);
                 if ((size_t)n >= expectedBytes) {
                     const int16_t *samples = (const int16_t *)(pktBuf + sizeof(esp32_udp_hdr_t));
@@ -1322,7 +1307,7 @@ static BOOL CountRealExternalDisplays(uint32_t *outRealExtCount,
 
     uint32_t kernelExt = 0;
     uint32_t realExt = cgRealExt;
-    if (CountKernelExternalDisplays(&kernelExt) && kernelExt > cgRealExt) {
+    if (CountKernelExternalDisplays(&kernelExt)) {
         realExt = kernelExt;
     }
 
@@ -1382,10 +1367,15 @@ static void TickleDisplayWake(BOOL force) {
 }
 
 /* Acquire Clamshell-proof powerd assertions:
- * - Always hold PreventUserIdleSystemSleep (SensorsActive=YES) + ClamshellSleepDisabled=1 so unplugging the last
- *   monitor or closing the lid is pre-protected before powerd runs EvaluateClamshell.
- * - Only hold PreventUserIdleDisplaySleep / UserIsActive / TickleDisplayWake when isHeadless == YES (0 physical displays
- *   active), so physical monitors and the built-in LCD can enter normal idle display sleep / screen saver when open.
+ * Hold all 4 SensorsActive=YES assertions (PreventUserIdleSystemSleep, PreventUserIdleDisplaySleep,
+ * UserIsActive, and 4s TickleDisplayWake) + ClamshellSleepDisabled=1 CONTINUOUSLY whenever armed.
+ * Why continuous holding is mandatory on Apple Silicon:
+ * 1. At the exact millisecond a physical DisplayPort/HDMI monitor is unplugged while in clamshell mode,
+ *    powerd checks if SensorsActive=YES display assertions are ALREADY active. If not, powerd immediately
+ *    emits "Display is turned off", which causes loginwindow to lock the screen before CGVirtualDisplay mounts.
+ * 2. When a DisplayPort/HDMI monitor is unplugged, coreaudiod releases ~80 audio power assertions to powerd,
+ *    congesting powerd's XPC queue for 1.5–2.5s. Holding our assertions continuously beforehand guarantees
+ *    zero blocking IOPMAssertionCreateWithProperties XPC calls during the hotplug transition.
  */
 static void AcquireStayAwakeAssertions(BOOL forceTickle, BOOL isHeadless) {
     BOOL newlyArmed = !g_clamshellStayAwakeActive;
@@ -1402,43 +1392,29 @@ static void AcquireStayAwakeAssertions(BOOL forceTickle, BOOL isHeadless) {
         IOPMAssertionCreateWithProperties((__bridge CFDictionaryRef)sysProps, &g_sysSleepAssertion);
     }
 
+    if (g_dispSleepAssertion == kIOPMNullAssertionID) {
+        NSDictionary *dispProps = @{
+            (__bridge NSString *)kIOPMAssertionTypeKey: (__bridge NSString *)kIOPMAssertionTypePreventUserIdleDisplaySleep,
+            (__bridge NSString *)kIOPMAssertionNameKey: @"ESP32 Smart Dummy Display Keep-Alive",
+            (__bridge NSString *)kIOPMAssertionLevelKey: @(kIOPMAssertionLevelOn),
+            @"SensorsActive": @YES,
+        };
+        IOPMAssertionCreateWithProperties((__bridge CFDictionaryRef)dispProps, &g_dispSleepAssertion);
+    }
+
+    if (g_userActAssertion == kIOPMNullAssertionID) {
+        NSDictionary *userProps = @{
+            (__bridge NSString *)kIOPMAssertionTypeKey: @"UserIsActive",
+            (__bridge NSString *)kIOPMAssertionNameKey: @"ESP32 Smart Dummy Clamshell UserActive",
+            (__bridge NSString *)kIOPMAssertionLevelKey: @(kIOPMAssertionLevelOn),
+            @"SensorsActive": @YES,
+        };
+        IOPMAssertionCreateWithProperties((__bridge CFDictionaryRef)userProps, &g_userActAssertion);
+    }
+
     SetRootDomainClamshellSleepDisabled(YES);
     g_clamshellStayAwakeActive = YES;
-
-    if (isHeadless) {
-        if (g_dispSleepAssertion == kIOPMNullAssertionID) {
-            NSDictionary *dispProps = @{
-                (__bridge NSString *)kIOPMAssertionTypeKey: (__bridge NSString *)kIOPMAssertionTypePreventUserIdleDisplaySleep,
-                (__bridge NSString *)kIOPMAssertionNameKey: @"ESP32 Smart Dummy Display Keep-Alive",
-                (__bridge NSString *)kIOPMAssertionLevelKey: @(kIOPMAssertionLevelOn),
-                @"SensorsActive": @YES,
-            };
-            IOPMAssertionCreateWithProperties((__bridge CFDictionaryRef)dispProps, &g_dispSleepAssertion);
-        }
-        if (g_userActAssertion == kIOPMNullAssertionID) {
-            NSDictionary *userProps = @{
-                (__bridge NSString *)kIOPMAssertionTypeKey: @"UserIsActive",
-                (__bridge NSString *)kIOPMAssertionNameKey: @"ESP32 Smart Dummy Clamshell UserActive",
-                (__bridge NSString *)kIOPMAssertionLevelKey: @(kIOPMAssertionLevelOn),
-                @"SensorsActive": @YES,
-            };
-            IOPMAssertionCreateWithProperties((__bridge CFDictionaryRef)userProps, &g_userActAssertion);
-        }
-        TickleDisplayWake(forceTickle || newlyArmed || becameHeadless);
-    } else {
-        if (g_dispSleepAssertion != kIOPMNullAssertionID) {
-            IOPMAssertionRelease(g_dispSleepAssertion);
-            g_dispSleepAssertion = kIOPMNullAssertionID;
-        }
-        if (g_userActAssertion != kIOPMNullAssertionID) {
-            IOPMAssertionRelease(g_userActAssertion);
-            g_userActAssertion = kIOPMNullAssertionID;
-        }
-        if (g_userTickleAssertion != kIOPMNullAssertionID) {
-            IOPMAssertionRelease(g_userTickleAssertion);
-            g_userTickleAssertion = kIOPMNullAssertionID;
-        }
-    }
+    TickleDisplayWake(forceTickle || newlyArmed || becameHeadless);
 }
 
 static void ReleaseStayAwakeAssertions(BOOL allowClamshellSleepNow) {
@@ -1555,6 +1531,7 @@ static void EnsureHiDPIMode1600x1000(CGDirectDisplayID dummyID) {
 }
 
 static void EvaluateState(NSString *trigger);
+static void ScheduleEvaluation(NSString *trigger, uint64_t delayMs);
 
 static void CreateDummyDisplay(void) {
     if (g_virtualDisplay != nil) {
@@ -1614,30 +1591,39 @@ static void CreateDummyDisplay(void) {
     settings.hiDPI = 1;
     settings.modes = @[modeLogical, modeBacking];
 
+    g_virtualDisplay = display;
+    g_dummyCreatedAt = CFAbsoluteTimeGetCurrent();
+
     if (![display applySettings:settings]) {
+        g_virtualDisplay = nil;
+        g_dummyCreatedAt = 0;
         LogMsg(@"ERROR: Failed to apply %ux%u HiDPI (%ux%u)@60Hz settings to CGVirtualDisplay",
                targetW, targetH, backingW, backingH);
         return;
     }
 
-    g_virtualDisplay = display;
-    g_dummyCreatedAt = CFAbsoluteTimeGetCurrent();
     EnsureNotMirrored(g_virtualDisplay.displayID);
     EnsureHiDPIMode1600x1000(g_virtualDisplay.displayID);
     AcquireStayAwakeAssertions(YES, YES);
 
-    /* Ensure powerd & WindowServer register display activity and HiDPI mode after virtual screen attaches */
+    /* Ensure powerd & WindowServer register display activity and HiDPI mode across the physical monitor teardown window */
     CGVirtualDisplay *createdDisplay = display;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 400 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
-        @autoreleasepool {
-            if (g_virtualDisplay != nil && g_virtualDisplay == createdDisplay) {
-                EnsureNotMirrored(g_virtualDisplay.displayID);
-                EnsureHiDPIMode1600x1000(g_virtualDisplay.displayID);
-                SetRootDomainClamshellSleepDisabled(YES);
-                TickleDisplayWake(YES);
+    const uint64_t followupDelaysMs[3] = { 120, 400, 900 };
+    for (size_t i = 0; i < 3; i++) {
+        const uint64_t delayMs = followupDelaysMs[i];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delayMs * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+            @autoreleasepool {
+                if (g_virtualDisplay != nil && g_virtualDisplay == createdDisplay) {
+                    EnsureNotMirrored(g_virtualDisplay.displayID);
+                    EnsureHiDPIMode1600x1000(g_virtualDisplay.displayID);
+                    SetRootDomainClamshellSleepDisabled(YES);
+                    if (delayMs == 400) {
+                        TickleDisplayWake(YES);
+                    }
+                }
             }
-        }
-    });
+        });
+    }
 
     LogMsg(@"ACTIVE: Mounted 'ESP32 Dummy %ux%u HiDPI' (%ux%u backing -> %ux%u@60Hz HiDPI, displayID=%u) + Clamshell Stay-Awake ON",
            targetW, targetH, backingW, backingH, targetW, targetH, g_virtualDisplay.displayID);
@@ -1655,23 +1641,22 @@ static void DestroyDummyDisplay(NSString *reason) {
 
 static void EvaluateState(NSString *trigger) {
     @autoreleasepool {
+        static BOOL s_inEvaluateState = NO;
+        if (s_inEvaluateState) {
+            ScheduleEvaluation(trigger, 15);
+            return;
+        }
+        s_inEvaluateState = YES;
         CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
 
-        /* 1. Periodic 5 MB log file rotation check (every 60s) */
-        static CFAbsoluteTime s_lastLogCheckTime = 0.0;
-        if ((now - s_lastLogCheckTime) >= 60.0) {
-            s_lastLogCheckTime = now;
-            struct stat st;
-            if (stat("/tmp/esp32-smart-dummy.log", &st) == 0 && st.st_size > 5 * 1024 * 1024) {
-                truncate("/tmp/esp32-smart-dummy.log", 0);
-                LogMsg(@"Rotated /tmp/esp32-smart-dummy.log (exceeded 5 MB)");
-            }
-        }
-
+        /* 1. Fast-Path Display & Clamshell Stay-Awake State Machine FIRST
+         * Runs before any CoreAudio HAL IPC or disk I/O so unplugging a DisplayPort/HDMI monitor
+         * mounts CGVirtualDisplay in <10ms without blocking behind coreaudiod's audio teardown lock. */
         uint32_t realExtCount = 0;
         uint32_t builtinCount = 0;
         uint32_t dummyCount = 0;
         if (!CountRealExternalDisplays(&realExtCount, &builtinCount, &dummyCount)) {
+            s_inEvaluateState = NO;
             return;
         }
         BOOL clamshellClosed = IsClamshellClosed();
@@ -1688,50 +1673,27 @@ static void EvaluateState(NSString *trigger) {
         BOOL micPresent = (g_standaloneMode || usbMicPresent || wirelessMicPresent || wirelessHoldPresent);
         BOOL onAC = IsOnACPower();
 
-        if (!wirelessMicPresent) {
-            atomic_store_explicit(&g_pcmRawPeak, 0.0f, memory_order_relaxed);
-            atomic_store_explicit(&g_pcmOutPeak, 0.0f, memory_order_relaxed);
-        }
-
-        SendActiveWirelessProbeIfNeeded();
-
-        /* 2. Self-healing CoreAudio BlackHole 2ch bridge & coreaudiod restart watchdog */
-        if (atomic_load_explicit(&g_blackHoleBridgeActive, memory_order_relaxed)) {
-            double lastRender = atomic_load_explicit(&g_lastBlackHoleRenderTime, memory_order_relaxed);
-            if (lastRender > 0.0 && (now - lastRender) > 3.0) {
-                LogMsg(@"WARNING: BlackHole render callback stalled for %.1fs (coreaudiod restart?) — reinitializing audio bridge",
-                       now - lastRender);
-                StopBlackHoleAudioBridge();
-                StartBlackHoleAudioBridge();
-            }
-        } else {
-            StartBlackHoleAudioBridge();
-        }
-        UpdateDefaultAudioInputDevice(usbMicPresent, wirelessMicPresent);
-        WriteDaemonStateFile();
-
         if (g_forceCreateForTest) {
             LogMsg(@"[%@] State check (TEST MODE): realExt=%u, builtin=%u, clamshellClosed=%d, micPresent=%d (standalone=%d, usb=%d, wifi=%d), onAC=%d",
                    trigger, realExtCount, builtinCount, clamshellClosed, micPresent, g_standaloneMode, usbMicPresent, wirelessMicPresent, onAC);
             AcquireStayAwakeAssertions(YES, YES);
             CreateDummyDisplay();
+            s_inEvaluateState = NO;
             return;
         }
 
         /* Core Decoupled Policy:
          * A) Clamshell Stay-Awake Assertions (wantKeepAwake = micPresent && onAC):
-         *    - PreventUserIdleSystemSleep (SensorsActive=YES) + ClamshellSleepDisabled=1 are held CONTINUOUSLY
+         *    - All 4 SensorsActive=YES assertions + ClamshellSleepDisabled=1 are held CONTINUOUSLY
          *      whenever micPresent && onAC, even when physical monitors or the open built-in LCD are active, so
          *      unplugging the last monitor or closing the lid is pre-protected before powerd runs EvaluateClamshell.
-         *    - Display wake assertions (PreventUserIdleDisplaySleep / UserIsActive / 4s TickleDisplayWake) are ONLY
-         *      held when isHeadless == YES, allowing physical monitors to sleep normally on idle.
          *
          * B) HiDPI (2x backing) Virtual Dummy Display (wantDummy = wantKeepAwake && isHeadless):
          *    - When !isHeadless (realExtCount >= 1 OR MacBook lid is open with built-in LCD active): Destroy the
          *      virtual display immediately so there is never a phantom 2nd screen when the lid is open and M3 Pro's
          *      external display pipes are 100% available for real physical monitors.
          *    - When isHeadless (realExtCount == 0 && (clamshellClosed || builtinCount == 0)): Mount the HiDPI virtual
-         *      display so UURemote / Screen Sharing has an active HiDPI framebuffer while in headless clamshell mode.
+         *      display immediately (<10ms) before WindowServer finishes removing the last physical display.
          */
         BOOL wantKeepAwake = (micPresent && onAC);
         BOOL wantDummy = (wantKeepAwake && isHeadless);
@@ -1754,8 +1716,8 @@ static void EvaluateState(NSString *trigger) {
         g_lastKeepAwake = (int)wantKeepAwake;
 
         if (wantKeepAwake) {
-            AcquireStayAwakeAssertions(NO, isHeadless);
             if (!isHeadless) {
+                AcquireStayAwakeAssertions(NO, NO);
                 NSString *yieldReason = (realExtCount >= 1)
                     ? [NSString stringWithFormat:@"%u real external display(s) connected", realExtCount]
                     : @"MacBook lid open (built-in display active)";
@@ -1777,6 +1739,7 @@ static void EvaluateState(NSString *trigger) {
                            trigger, clamshellClosed, g_standaloneMode, usbMicPresent, wirelessMicPresent, g_targetWidth, g_targetHeight);
                     CreateDummyDisplay();
                 } else {
+                    AcquireStayAwakeAssertions(NO, YES);
                     EnsureNotMirrored(g_virtualDisplay.displayID);
                     EnsureHiDPIMode1600x1000(g_virtualDisplay.displayID);
                 }
@@ -1793,6 +1756,78 @@ static void EvaluateState(NSString *trigger) {
                        trigger, realExtCount, clamshellClosed, why);
             }
         }
+
+        /* 2. Telemetry & Non-Blocking Background Audio Bridge Maintenance
+         * WriteDaemonStateFile() runs immediately on the main thread; all CoreAudio HAL IPC
+         * (StartBlackHoleAudioBridge / StopBlackHoleAudioBridge / UpdateDefaultAudioInputDevice)
+         * is offloaded to g_audioBridgeQueue so a slow or wedged coreaudiod driver during
+         * DisplayPort/HDMI hotplug can NEVER block the main display/power runloop thread. */
+        if (!wirelessMicPresent) {
+            atomic_store_explicit(&g_pcmRawPeak, 0.0f, memory_order_relaxed);
+            atomic_store_explicit(&g_pcmOutPeak, 0.0f, memory_order_relaxed);
+        }
+
+        SendActiveWirelessProbeIfNeeded();
+        WriteDaemonStateFile();
+
+        atomic_store_explicit(&g_wantAudioUsbMic, (bool)usbMicPresent, memory_order_relaxed);
+        atomic_store_explicit(&g_wantAudioWifiMic, (bool)wirelessMicPresent, memory_order_relaxed);
+        if (!atomic_exchange_explicit(&g_audioMaintenancePending, true, memory_order_acq_rel)) {
+            static dispatch_once_t audioQueueOnce;
+            dispatch_once(&audioQueueOnce, ^{
+                dispatch_queue_attr_t attr = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0);
+                g_audioBridgeQueue = dispatch_queue_create("com.waveshare.esp32-smart-dummy.audio-hal", attr);
+            });
+            dispatch_async(g_audioBridgeQueue, ^{
+                @autoreleasepool {
+                    atomic_store_explicit(&g_audioMaintenancePending, false, memory_order_release);
+                    BOOL usbMic = (BOOL)atomic_load_explicit(&g_wantAudioUsbMic, memory_order_relaxed);
+                    BOOL wifiMic = (BOOL)atomic_load_explicit(&g_wantAudioWifiMic, memory_order_relaxed);
+                    CFAbsoluteTime nowAudio = CFAbsoluteTimeGetCurrent();
+
+                    if (atomic_load_explicit(&g_blackHoleBridgeActive, memory_order_relaxed)) {
+                        double lastRender = atomic_load_explicit(&g_lastBlackHoleRenderTime, memory_order_relaxed);
+                        if (lastRender > 0.0 && (nowAudio - lastRender) > 10.0) {
+                            LogMsg(@"WARNING: BlackHole render callback stalled for %.1fs (coreaudiod restart?) — reinitializing audio bridge",
+                                   nowAudio - lastRender);
+                            StopBlackHoleAudioBridge();
+                            if (StartBlackHoleAudioBridge()) {
+                                WriteDaemonStateFile();
+                            }
+                        }
+                    } else {
+                        if (StartBlackHoleAudioBridge()) {
+                            WriteDaemonStateFile();
+                        }
+                    }
+
+                    static int s_lastAudioUsbState = -1;
+                    static int s_lastAudioWifiState = -1;
+                    static CFAbsoluteTime s_lastAudioCheckTime = 0.0;
+                    if ((int)usbMic != s_lastAudioUsbState ||
+                        (int)wifiMic != s_lastAudioWifiState ||
+                        (nowAudio - s_lastAudioCheckTime) >= 6.0) {
+                        s_lastAudioUsbState = (int)usbMic;
+                        s_lastAudioWifiState = (int)wifiMic;
+                        s_lastAudioCheckTime = nowAudio;
+                        UpdateDefaultAudioInputDevice(usbMic, wifiMic);
+                    }
+                }
+            });
+        }
+
+        /* 3. Periodic 5 MB log file rotation check (every 60s) */
+        CFAbsoluteTime nowAfterDisplay = CFAbsoluteTimeGetCurrent();
+        static CFAbsoluteTime s_lastLogCheckTime = 0.0;
+        if ((nowAfterDisplay - s_lastLogCheckTime) >= 60.0) {
+            s_lastLogCheckTime = nowAfterDisplay;
+            struct stat st;
+            if (stat("/tmp/esp32-smart-dummy.log", &st) == 0 && st.st_size > 5 * 1024 * 1024) {
+                truncate("/tmp/esp32-smart-dummy.log", 0);
+                LogMsg(@"Rotated /tmp/esp32-smart-dummy.log (exceeded 5 MB)");
+            }
+        }
+        s_inEvaluateState = NO;
     }
 }
 
@@ -1807,7 +1842,7 @@ static void ScheduleEvaluation(NSString *trigger, uint64_t delayMs) {
             dispatch_source_set_timer(g_evalTimer,
                                       dispatch_time(DISPATCH_TIME_NOW, delayMs * NSEC_PER_MSEC),
                                       DISPATCH_TIME_FOREVER,
-                                      10 * NSEC_PER_MSEC);
+                                      5 * NSEC_PER_MSEC);
             dispatch_source_set_event_handler(g_evalTimer, ^{
                 EvaluateState(trigger);
             });
@@ -1818,7 +1853,6 @@ static void ScheduleEvaluation(NSString *trigger, uint64_t delayMs) {
 
 static void DisplayReconfigCallback(CGDirectDisplayID display, CGDisplayChangeSummaryFlags flags, void *userInfo) {
     @autoreleasepool {
-        (void)display;
         (void)userInfo;
         if (g_clamshellStayAwakeActive) {
             SetRootDomainClamshellSleepDisabled(YES);
@@ -1826,8 +1860,12 @@ static void DisplayReconfigCallback(CGDirectDisplayID display, CGDisplayChangeSu
         if (flags & kCGDisplayBeginConfigurationFlag) {
             return;
         }
+        if (g_virtualDisplay != nil && display == g_virtualDisplay.displayID) {
+            return;
+        }
         if (flags & (kCGDisplayAddFlag | kCGDisplayRemoveFlag | kCGDisplayEnabledFlag | kCGDisplayDisabledFlag)) {
-            ScheduleEvaluation(@"DisplayHotplug", 20);
+            EvaluateState(@"DisplayHotplug");
+            ScheduleEvaluation(@"DisplayHotplugFollowup", 150);
         }
     }
 }
@@ -1859,7 +1897,8 @@ static void KernelFramebufferInterestCallback(void *refcon, io_service_t service
         if (g_clamshellStayAwakeActive) {
             SetRootDomainClamshellSleepDisabled(YES);
         }
-        ScheduleEvaluation(@"KernelFramebufferEvent", 20);
+        EvaluateState(@"KernelFramebufferEvent");
+        ScheduleEvaluation(@"KernelFramebufferFollowup", 150);
     }
 }
 
@@ -1950,10 +1989,21 @@ static void RegisterSignalHandlers(void) {
                     if (wirelessStillActive) {
                         WriteDaemonStateFile();
                     } else {
-                        UpdateDefaultAudioInputDevice(NO, NO);
                         unlink(STATE_FILE_PATH);
                     }
-                    StopBlackHoleAudioBridge();
+                    if (g_audioBridgeQueue) {
+                        dispatch_semaphore_t doneSem = dispatch_semaphore_create(0);
+                        dispatch_async(g_audioBridgeQueue, ^{
+                            @autoreleasepool {
+                                if (!wirelessStillActive) {
+                                    UpdateDefaultAudioInputDevice(NO, NO);
+                                }
+                                StopBlackHoleAudioBridge();
+                                dispatch_semaphore_signal(doneSem);
+                            }
+                        });
+                        dispatch_semaphore_wait(doneSem, dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_MSEC));
+                    }
                     StopUdpListener();
                     uint32_t realExt = 0, builtin = 0;
                     CountRealExternalDisplays(&realExt, &builtin, NULL);
@@ -2114,7 +2164,7 @@ int main(int argc, const char * argv[]) {
             if (ReadDaemonStateFile(&lastRx, &bhBridge, NULL, 0, &telem)) {
                 /* State file from running daemon is valid */
             } else {
-                bhBridge = (FindBlackHoleDeviceID() != kAudioObjectUnknown);
+                bhBridge = (access("/Library/Audio/Plug-Ins/HAL/BlackHole2ch.driver", F_OK) == 0);
             }
             BOOL wifiMic = (lastRx > 0.0 && (CFAbsoluteTimeGetCurrent() - lastRx) < 5.0);
             BOOL mic = (g_standaloneMode || usbMic || wifiMic);
@@ -2181,8 +2231,7 @@ int main(int argc, const char * argv[]) {
 
         RegisterSignalHandlers();
 
-        /* 0. Start CoreAudio BlackHole 2ch Loopback Bridge & Wireless UDP Listener (Port 18796) */
-        StartBlackHoleAudioBridge();
+        /* 0. Start Wireless UDP Listener (Port 18796); CoreAudio BlackHole bridge starts asynchronously on g_audioBridgeQueue */
         StartUdpListener();
 
         /* 1. Register CoreGraphics display hotplug callback */

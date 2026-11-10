@@ -537,6 +537,7 @@ static void wifi_audio_task(void *arg)
 
     int sock = -1;
     uint32_t udp_seq = 0;
+    uint32_t hb_seq = 0;
     uint32_t audio_pkt_cnt = 0;
     TickType_t last_bcast_tick = 0;
     esp32_udp_audio_pkt_t audio_pkt;
@@ -582,13 +583,13 @@ static void wifi_audio_task(void *arg)
         /* Broadcast discovery fallback when Mac ACK has not been received in the last 5 seconds */
         if ((!s_mac_ack_received || (now - s_last_mac_ack_tick) > pdMS_TO_TICKS(5000)) &&
             (now - last_bcast_tick) >= pdMS_TO_TICKS(2000)) {
-            send_udp_heartbeat(sock, &s_bcast_addr, flags, &udp_seq);
+            send_udp_heartbeat(sock, &s_bcast_addr, flags, &hb_seq);
             last_bcast_tick = now;
         }
 
         if (usb_uac_active) {
             /* USB UAC is actively streaming audio; send Wi-Fi heartbeat every 500ms without reading I2S */
-            send_udp_heartbeat(sock, &s_mac_addr, flags, &udp_seq);
+            send_udp_heartbeat(sock, &s_mac_addr, flags, &hb_seq);
             vTaskDelay(pdMS_TO_TICKS(500));
             continue;
         }
@@ -618,7 +619,7 @@ static void wifi_audio_task(void *arg)
         audio_pkt_cnt++;
         if (audio_pkt_cnt >= 100) {
             audio_pkt_cnt = 0;
-            send_udp_heartbeat(sock, &s_mac_addr, flags, &udp_seq);
+            send_udp_heartbeat(sock, &s_mac_addr, flags, &hb_seq);
         }
     }
 }

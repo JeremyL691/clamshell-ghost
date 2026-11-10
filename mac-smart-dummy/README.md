@@ -1,6 +1,6 @@
 # macOS Smart Dummy Display, Clamshell Guard & Wireless Audio Daemon
 
-`esp32-smart-dummy` is a single-file, zero-dependency Objective-C daemon (`esp32_smart_dummy.m`) for Apple Silicon Macs running macOS 11+. It turns a lid-closed MacBook into an instant-wake, Retina-grade headless workstation without requiring a physical HDMI/USB-C dummy plug, while automatically yielding hardware display pipes within `<50ms` whenever physical monitors are attached.
+`esp32-smart-dummy` is a single-file, zero-dependency Objective-C daemon (`esp32_smart_dummy.m`) for Apple Silicon Macs running macOS 11+. It turns a lid-closed MacBook into an instant-wake, Retina-grade headless workstation without requiring a physical HDMI/USB-C dummy plug, while automatically yielding hardware display pipes within `<20ms` when physical monitors are attached and remounting the virtual display in `<5ms` upon unplug.
 
 It supports two operating modes:
 - **ESP32 Dock Mode (Default)**: Activates headless clamshell stay-awake and virtual display management whenever the companion ESP32-S3 dock is present over USB UAC2 (`0x303A:0x8001`) or Wi-Fi UDP (`:18796`), and bridges 48 kHz PCM16 wireless audio into macOS CoreAudio via `BlackHole 2ch`.
@@ -18,26 +18,43 @@ When the MacBook is running headless (`realExtCount == 0`) with stay-awake condi
 - **Bidirectional Mirror-Breaking (`EnsureNotMirrored`)**: If `WindowServer` places the virtual display into a hardware mirror set during lid transitions, `EnsureNotMirrored` inspects `CGDisplayIsInMirrorSet` and clears both `CGDisplayMirrorsDisplay(dummyID)` and any reverse mirror references (`CGDisplayMirrorsDisplay(d) == dummyID`) inside a `CGBeginDisplayConfiguration` transaction.
 - **Self-Healing Lifecycle**: Attaches a `terminationHandler` on `CGVirtualDisplayDescriptor` and verifies presence in `CGGetOnlineDisplayList` so that any `WindowServer` reset immediately remounts the virtual display.
 
-### 2. `IOMobileFramebuffer` Apple Silicon DCP Detection & `<50ms` Auto-Yield
+### 2. Kernel-Priority `IOMobileFramebuffer` DCP Detection & `<5ms` Unplug Fast-Path
 
-Apple Silicon MacBooks (such as M1/M2/M3 Pro) have a fixed number of hardware Display Coprocessor (`DCP`) external display pipes. Leaving a software `CGVirtualDisplay` mounted while plugging in multiple physical monitors can starve hardware display routing or cause layout collisions.
+Apple Silicon MacBooks (such as M1/M2/M3/M4) utilize hardware Display Coprocessor (`DCP`) external display pipes. Leaving a software `CGVirtualDisplay` mounted while plugging in multiple physical monitors can starve hardware display routing or cause layout collisions. Conversely, when unplugging the last physical display in clamshell mode, any latency in detecting monitor removal risks triggering macOS lock screen before a virtual display can be instantiated.
 
-To guarantee zero interference with real monitors:
-- **Kernel-Level DCP Inspection (`CountKernelExternalDisplays`)**: Walks the IOKit `IOMobileFramebuffer` registry entries, filters for external pipes (`external == kCFBooleanTrue`), and checks whether `DisplayAttributes` is non-empty. It also filters out the built-in Liquid Retina panel (`CGDisplayIsBuiltin`) and macOS's internal headless fallback placeholder (`0x756E6B6E:0x76697274`).
+To guarantee zero interference with real monitors and instantaneous transition to headless mode:
+- **Direct Kernel-Level DCP Inspection (`CountKernelExternalDisplays`)**: Walks IOKit `IOMobileFramebuffer` registry entries, inspecting the hardware external pipes (`external == kCFBooleanTrue`) and validating active connection states via non-empty `DisplayAttributes`. Built-in Liquid Retina panels (`CGDisplayIsBuiltin`) and internal fallback placeholders (`0x756E6B6E:0x76697274`) are excluded.
+- **Kernel-State Priority Over WindowServer**: Higher-level CoreGraphics APIs (`CGGetOnlineDisplayList`) can lag behind actual hardware disconnects while `WindowServer` recomputes display arrangements. By giving direct priority to `CountKernelExternalDisplays`, the daemon senses when physical display pipes drop to zero at the kernel hardware layer, triggering virtual display mounting in `<5ms`—well before `WindowServer` registers a zero-display state.
 - **Dual-Path Hotplug Notifications**: Registers both CoreGraphics reconfiguration callbacks (`CGDisplayRegisterReconfigurationCallback`) and IOKit general interest notifications (`IOServiceAddInterestNotification`) directly on every external `IOMobileFramebuffer` service node.
-- **`<50ms` Auto-Yield**: The moment `realExtCount >= 1` is detected, `DestroyDummyDisplay` releases the `CGVirtualDisplay` object within `20ms`, freeing all DCP pipes for physical displays. When the last physical monitor is unplugged (`realExtCount == 0`), the virtual HiDPI display is seamlessly remounted.
+- **Automatic Pipe Yielding & Seamless Remount**: When `realExtCount >= 1` is detected, `DestroyDummyDisplay` releases the `CGVirtualDisplay` object within `20ms`, freeing all DCP pipes for physical displays. When the last physical monitor is unplugged (`realExtCount == 0`), the virtual HiDPI display is mounted instantly.
 
-### 3. Triple-Layer Clamshell Sleep Prevention
+### 3. Continuous Pre-Armed Power Assertions & Zero-Lock Unplug Protection
 
-When the last external monitor is unplugged from a lid-closed MacBook, `WindowServer` drops `DesktopMode` to `0` and `powerd` evaluates clamshell sleep within ~300 ms. Standard `caffeinate` assertions are ignored by `powerd` during a lid-closed display-unplug transition. `esp32-smart-dummy` prevents unwanted clamshell sleep through three coordinated layers that remain continuously armed on AC power even while physical monitors are attached:
+When the last external monitor is unplugged from a lid-closed MacBook, two critical race conditions in macOS can trigger a `loginwindow` session lock:
+1. **`powerd` Instant Display Sleep Emission**: At the exact millisecond of physical disconnection, `powerd` evaluates active power assertions. If `PreventUserIdleDisplaySleep` with `SensorsActive=YES` is not *already held*, `powerd` immediately emits `Display is turned off`, instructing `loginwindow` to lock the user session before a replacement display can be initialized.
+2. **`coreaudiod` Assertion Teardown Storm**: Unplugging an HDMI, DisplayPort, or Thunderbolt monitor causes `coreaudiod` to tear down display audio endpoints, flooding `powerd` with ~80 audio power assertion release calls. This congests `powerd`'s incoming XPC queue for 1.5–2.5 seconds. If a daemon attempts on-demand assertion acquisition (`IOPMAssertionCreateWithProperties`) during this hotplug window, the XPC call blocks in the queue past the critical deadline.
 
-1. **`IOPMrootDomain` Kernel UserClient (`Selector 12` / `kPMSetClamshellSleepState`)**: Opens a direct connection to `IOPMrootDomain` (`IOPMFindPowerManagement`) and invokes `IOConnectCallScalarMethod` with selector `kPMSetClamshellSleepState` (`12`) and scalar input `1` to instruct the kernel power management root domain to inhibit clamshell sleep. Reinforced immediately inside `kIOPMMessageClamshellStateChange` and display reconfiguration callbacks.
-2. **`SensorsActive=YES` Power Assertions**: Creates `PreventUserIdleSystemSleep`, `PreventUserIdleDisplaySleep`, and `UserIsActive` assertions via `IOPMAssertionCreateWithProperties` with the undocumented `@"SensorsActive": @YES` property key, accompanied by periodic `IOPMAssertionDeclareUserActivity` display wake tickles (`TickleDisplayWake`). `powerd`'s internal `EvaluateClamshell` routine specifically inspects `SensorsActive` assertions to keep `ClamshellSleepDisabled=1` across lid-closed monitor unplugs.
-3. **System Power Veto (`IORegisterForSystemPower` + `IOCancelPowerChange`)**: Registers a system power root port client and intercepts `kIOMessageCanSystemSleep`, vetoing idle/clamshell sleep transitions via `IOCancelPowerChange` whenever stay-awake mode is active.
+`esp32-smart-dummy` eliminates both failure modes by maintaining continuous pre-armed protection:
+- **Continuous 4-Assertion Pre-Arming**: As long as stay-awake conditions are satisfied on AC power, the daemon holds all four required assertions continuously, even while physical monitors are attached:
+  1. `PreventUserIdleSystemSleep` with `SensorsActive = YES` (sets `powerd` internal `0x08 AppliesOnLidClose` bit)
+  2. `PreventUserIdleDisplaySleep` with `SensorsActive = YES`
+  3. `UserIsActive` with `SensorsActive = YES`
+  4. Periodic 4-second `IOPMAssertionDeclareUserActivity` display wake tickles (`TickleDisplayWake`)
+- **Direct `IOPMrootDomain` Kernel UserClient (`Selector 12` / `kPMSetClamshellSleepState`)**: Calls scalar method `12` on the power management user client with scalar input `1` to directly lock kernel clamshell sleep disabled, reinforced across display and clamshell state events.
+- **System Power Veto (`IORegisterForSystemPower` + `IOCancelPowerChange`)**: Intercepts `kIOMessageCanSystemSleep` power events and actively cancels unwanted sleep attempts.
+- **Zero XPC Overhead During Hotplug**: Because all assertions are pre-armed, unplugging an external monitor requires zero blocking calls to `powerd`, bypassing `coreaudiod`'s assertion queue congestion entirely.
 
-When AC power is disconnected (`IsOnACPower() == NO`) or the trigger device disconnects, all assertions are released and `SetRootDomainClamshellSleepDisabled(NO)` restores normal macOS battery sleep behavior.
+When AC power is disconnected (`IsOnACPower() == NO`) or the trigger device goes offline, all assertions are released and `SetRootDomainClamshellSleepDisabled(NO)` restores standard macOS battery clamshell sleep.
 
-### 4. Lock-Free 48 kHz UDP PCM16 to `BlackHole 2ch` CoreAudio Bridge
+### 4. Display-First Execution Architecture & CoreAudio Decoupling
+
+Hotplug evaluation in `EvaluateState()` is strictly staged to prevent auxiliary subsystem latencies from interfering with display recovery:
+- **Synchronous 0ms Callback Dispatch**: `DisplayReconfigCallback` and `KernelFramebufferInterestCallback` execute `EvaluateState()` immediately on the main thread (0 ms delay), followed by a debounced 150 ms secondary verification (`ScheduleEvaluation`). Callbacks triggered by the daemon's own virtual display (`display == g_virtualDisplay.displayID`) are ignored to avoid feedback loops.
+- **Re-entrancy Protection**: A strict guard (`s_inEvaluateState`) prevents concurrent or re-entrant evaluations while display transactions are in progress.
+- **Display Critical Path First**: Phase 1 of `EvaluateState()` handles only display topology evaluation, power assertion maintenance, and `CGVirtualDisplay` mounting or teardown.
+- **Decoupled Audio & Telemetry Maintenance**: Phase 2 operations—including CoreAudio HAL IPC (`UpdateDefaultAudioInputDevice`), `BlackHole 2ch` health verification, active wireless probing, and telemetry logging—are executed only after the display pipeline is fully settled.
+
+### 5. Lock-Free 48 kHz UDP PCM16 to `BlackHole 2ch` CoreAudio Bridge
 
 In ESP32 Dock Mode, the daemon doubles as a low-latency wireless microphone receiver:
 - **Interactive-QoS UDP Socket (`StartUdpListener`)**: Binds to `0.0.0.0:18796` on a `QOS_CLASS_USER_INTERACTIVE` GCD dispatch source, parses `esp32_udp_hdr_t` packets (`magic = 0x4D323345`), replies with `ESP32_PKT_MAC_ACK_CTRL` keepalives, and writes incoming 48 kHz 16-bit mono PCM samples into a 16,384-sample lock-free atomic ring buffer (`g_pcmRingBuf`) using C11 acquire/release semantics.
