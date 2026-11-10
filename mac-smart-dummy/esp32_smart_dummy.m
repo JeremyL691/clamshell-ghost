@@ -12,10 +12,12 @@
 #import <IOKit/pwr_mgt/IOPMLib.h>
 #include <signal.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <math.h>
 #include <stdatomic.h>
 #include <os/lock.h>
 
@@ -81,12 +83,12 @@ typedef struct __attribute__((packed)) {
     uint32_t seq;         /* sequence number */
 } esp32_udp_hdr_t;
 
-/* Lock-free 48kHz PCM16 Ring Buffer (16384 samples = ~341ms @ 48kHz) */
-#define PCM_RING_CAPACITY           16384U
+/* Lock-free 48kHz PCM16 Ring Buffer (32768 samples = ~682ms @ 48kHz) */
+#define PCM_RING_CAPACITY           32768U
 #define PCM_RING_MASK               (PCM_RING_CAPACITY - 1U)
-#define PCM_MAX_LATENCY_SAMPLES     4800U   /* 100ms @ 48kHz cap threshold */
-#define PCM_TARGET_LATENCY_SAMPLES  1920U   /* 40ms @ 48kHz target latency */
-#define PCM_PREBUFFER_SAMPLES       960U    /* 20ms @ 48kHz prebuffer */
+#define PCM_MAX_LATENCY_SAMPLES     9600U   /* 200ms @ 48kHz cap threshold */
+#define PCM_TARGET_LATENCY_SAMPLES  3840U   /* 80ms @ 48kHz target latency */
+#define PCM_PREBUFFER_SAMPLES       3840U   /* 80ms @ 48kHz prebuffer (absorbs Wi-Fi jitter bursts) */
 
 #define STATE_FILE_PATH             "/tmp/esp32-smart-dummy.state"
 #define STATE_FILE_TMP_PATH         "/tmp/esp32-smart-dummy.state.tmp"
@@ -112,6 +114,7 @@ static IONotificationPortRef g_sysPowerNotifyPort = NULL;
 static io_object_t g_fbNotifiers[8];
 static uint32_t g_fbNotifierCount = 0;
 static BOOL g_clamshellStayAwakeActive = NO;
+static BOOL g_lastHeadlessAssertionState = NO;
 
 static BOOL g_forceCreateForTest = NO;
 static BOOL g_simulateZeroRealMonitors = NO;
@@ -129,24 +132,45 @@ static _Atomic uint32_t g_pcmWriteIdx = 0;
 static _Atomic uint32_t g_pcmReadIdx = 0;
 static _Atomic double g_lastWirelessRxTime = 0.0;
 static _Atomic double g_lastAudioPktTime = 0.0;
+static _Atomic double g_lastBlackHoleRenderTime = 0.0;
 static _Atomic uint64_t g_wirelessPktCount = 0;
+static _Atomic uint64_t g_bhUnderruns = 0;
+static _Atomic uint64_t g_bhOverruns = 0;
+static _Atomic uint64_t g_udpSeqDrops = 0;
+static _Atomic float g_pcmRawPeak = 0.0f;
+static _Atomic float g_pcmOutPeak = 0.0f;
 static _Atomic uint8_t g_lastWirelessFlags = 0;
+static uint32_t g_lastUdpSeq = 0;
+static BOOL g_hasLastUdpSeq = NO;
+static int16_t g_lastUdpPcmSample = 0;
 static char g_lastEsp32Ip[64] = {0};
 static os_unfair_lock g_ipLock = OS_UNFAIR_LOCK_INIT;
 static os_unfair_lock g_stateFileLock = OS_UNFAIR_LOCK_INIT;
 
-static int g_udpSock = -1;
+static _Atomic int g_udpSock = -1;
 static dispatch_queue_t g_udpQueue = nil;
 static dispatch_source_t g_udpReadSource = nil;
 static CFAbsoluteTime g_lastUdpAckTime = 0.0;
-static CFAbsoluteTime g_lastStateWriteFromUdp = 0.0;
 
 static AudioComponentInstance g_blackHoleAudioUnit = NULL;
 static _Atomic bool g_blackHoleBridgeActive = false;
 static BOOL g_pcmPrebuffering = YES;
 
+/* Adaptive fractional resampler + Broadcast Voice DSP state (CoreAudio render thread) */
+static double g_readFrac = 0.0;
+static float g_lastRenderedSample = 0.0f;
+static float g_dcPrevX = 0.0f;
+static float g_dcPrevY = 0.0f;
+static float g_hpfX1 = 0.0f, g_hpfX2 = 0.0f;
+static float g_hpfY1 = 0.0f, g_hpfY2 = 0.0f;
+static float g_lpfX1 = 0.0f, g_lpfX2 = 0.0f;
+static float g_lpfY1 = 0.0f, g_lpfY2 = 0.0f;
+static float g_envLevel = 0.0f;
+static float g_gateGainSmooth = 0.15f;
+
 /* State tracking to avoid duplicate log spam */
 static int g_lastRealExtCount = -1;
+static int g_lastClamshellClosed = -1;
 static int g_lastMicPresent = -1;
 static int g_lastUsbMicPresent = -1;
 static int g_lastWifiMicPresent = -1;
@@ -175,6 +199,14 @@ static void LogMsg(NSString *fmt, ...) {
     }
 }
 
+typedef struct {
+    uint64_t bhUnderruns;
+    uint64_t bhOverruns;
+    uint64_t udpSeqDrops;
+    float pcmRawPeak;
+    float pcmOutPeak;
+} DaemonAudioTelemetry;
+
 static void WriteDaemonStateFile(void) {
     if (!g_isDaemonMode) {
         return;
@@ -182,6 +214,11 @@ static void WriteDaemonStateFile(void) {
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
     CFAbsoluteTime lastRx = atomic_load_explicit(&g_lastWirelessRxTime, memory_order_relaxed);
     uint64_t pktCnt = atomic_load_explicit(&g_wirelessPktCount, memory_order_relaxed);
+    uint64_t bhUnderruns = atomic_load_explicit(&g_bhUnderruns, memory_order_relaxed);
+    uint64_t bhOverruns = atomic_load_explicit(&g_bhOverruns, memory_order_relaxed);
+    uint64_t udpSeqDrops = atomic_load_explicit(&g_udpSeqDrops, memory_order_relaxed);
+    float rawPeak = atomic_load_explicit(&g_pcmRawPeak, memory_order_relaxed);
+    float outPeak = atomic_load_explicit(&g_pcmOutPeak, memory_order_relaxed);
     bool bhActive = atomic_load_explicit(&g_blackHoleBridgeActive, memory_order_relaxed);
     BOOL wifiPresent = (lastRx > 0.0 && (now - lastRx) < 5.0);
 
@@ -190,20 +227,30 @@ static void WriteDaemonStateFile(void) {
     strncpy(ipBuf, g_lastEsp32Ip, sizeof(ipBuf) - 1);
     os_unfair_lock_unlock(&g_ipLock);
 
-    char buf[512];
+    char buf[768];
     int len = snprintf(buf, sizeof(buf),
                        "updated_at=%.3f\n"
                        "last_wireless_rx=%.3f\n"
                        "wireless_present=%d\n"
                        "blackhole_bridge=%d\n"
                        "wireless_pkt_count=%llu\n"
-                       "esp32_ip=%s\n",
+                       "esp32_ip=%s\n"
+                       "bh_underruns=%llu\n"
+                       "bh_overruns=%llu\n"
+                       "udp_seq_drops=%llu\n"
+                       "pcm_raw_peak=%.4f\n"
+                       "pcm_out_peak=%.4f\n",
                        now,
                        lastRx,
                        wifiPresent ? 1 : 0,
                        bhActive ? 1 : 0,
                        (unsigned long long)pktCnt,
-                       ipBuf[0] ? ipBuf : "none");
+                       ipBuf[0] ? ipBuf : "none",
+                       (unsigned long long)bhUnderruns,
+                       (unsigned long long)bhOverruns,
+                       (unsigned long long)udpSeqDrops,
+                       (double)rawPeak,
+                       (double)outPeak);
     if (len <= 0 || len >= (int)sizeof(buf)) {
         return;
     }
@@ -219,7 +266,11 @@ static void WriteDaemonStateFile(void) {
     os_unfair_lock_unlock(&g_stateFileLock);
 }
 
-static BOOL ReadDaemonStateFile(CFAbsoluteTime *outLastWirelessRx, BOOL *outBhBridge, char *outIp, size_t ipLen) {
+static BOOL ReadDaemonStateFile(CFAbsoluteTime *outLastWirelessRx,
+                                BOOL *outBhBridge,
+                                char *outIp,
+                                size_t ipLen,
+                                DaemonAudioTelemetry *outTelemetry) {
     NSString *content = [NSString stringWithContentsOfFile:@(STATE_FILE_PATH)
                                                   encoding:NSUTF8StringEncoding
                                                      error:nil];
@@ -229,6 +280,7 @@ static BOOL ReadDaemonStateFile(CFAbsoluteTime *outLastWirelessRx, BOOL *outBhBr
     CFAbsoluteTime updatedAt = 0.0;
     CFAbsoluteTime lastRx = 0.0;
     int bhBridge = 0;
+    DaemonAudioTelemetry telem = {0};
     for (NSString *line in [content componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]]) {
         if ([line hasPrefix:@"updated_at="]) {
             updatedAt = [[line substringFromIndex:11] doubleValue];
@@ -240,6 +292,16 @@ static BOOL ReadDaemonStateFile(CFAbsoluteTime *outLastWirelessRx, BOOL *outBhBr
             NSString *ip = [line substringFromIndex:9];
             strncpy(outIp, [ip UTF8String], ipLen - 1);
             outIp[ipLen - 1] = '\0';
+        } else if ([line hasPrefix:@"bh_underruns="]) {
+            telem.bhUnderruns = (uint64_t)strtoull([[line substringFromIndex:13] UTF8String], NULL, 10);
+        } else if ([line hasPrefix:@"bh_overruns="]) {
+            telem.bhOverruns = (uint64_t)strtoull([[line substringFromIndex:12] UTF8String], NULL, 10);
+        } else if ([line hasPrefix:@"udp_seq_drops="]) {
+            telem.udpSeqDrops = (uint64_t)strtoull([[line substringFromIndex:14] UTF8String], NULL, 10);
+        } else if ([line hasPrefix:@"pcm_raw_peak="]) {
+            telem.pcmRawPeak = [[line substringFromIndex:13] floatValue];
+        } else if ([line hasPrefix:@"pcm_out_peak="]) {
+            telem.pcmOutPeak = [[line substringFromIndex:13] floatValue];
         }
     }
     if (updatedAt <= 0.0 || (CFAbsoluteTimeGetCurrent() - updatedAt) > 10.0) {
@@ -247,6 +309,7 @@ static BOOL ReadDaemonStateFile(CFAbsoluteTime *outLastWirelessRx, BOOL *outBhBr
     }
     if (outLastWirelessRx) *outLastWirelessRx = lastRx;
     if (outBhBridge) *outBhBridge = (bhBridge != 0);
+    if (outTelemetry) *outTelemetry = telem;
     return YES;
 }
 
@@ -293,13 +356,13 @@ static BOOL IsEsp32WirelessPresent(void) {
         return (lastRx > 0.0 && (now - lastRx) < 12.0);
     }
     CFAbsoluteTime stateLastRx = 0.0;
-    if (ReadDaemonStateFile(&stateLastRx, NULL, NULL, 0)) {
+    if (ReadDaemonStateFile(&stateLastRx, NULL, NULL, 0, NULL)) {
         return (stateLastRx > 0.0 && (now - stateLastRx) < 12.0);
     }
     return NO;
 }
 
-/* Extended 5-minute wireless holdover when headless (realExtCount == 0) so transient Wi-Fi jitter
+/* Extended 5-minute wireless holdover when headless so transient Wi-Fi jitter
  * or a 2-minute nightly router reboot never puts a headless clamshell Mac to sleep. */
 static BOOL IsEsp32WirelessHoldActive(BOOL isHeadless) {
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
@@ -312,7 +375,8 @@ static BOOL IsEsp32WirelessHoldActive(BOOL isHeadless) {
 }
 
 static void SendActiveWirelessProbeIfNeeded(void) {
-    if (g_udpSock < 0) {
+    int sockFd = atomic_load_explicit(&g_udpSock, memory_order_relaxed);
+    if (sockFd < 0) {
         return;
     }
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
@@ -336,10 +400,10 @@ static void SendActiveWirelessProbeIfNeeded(void) {
             .magic = ESP32_UDP_MAGIC,
             .pkt_type = ESP32_PKT_MAC_ACK_CTRL,
             .flags = 0,
-            .sample_cnt = 0,
+            .sample_cnt = 100,
             .seq = 0
         };
-        sendto(g_udpSock, &probe, sizeof(probe), 0, (const struct sockaddr *)&dst, sizeof(dst));
+        sendto(sockFd, &probe, sizeof(probe), 0, (const struct sockaddr *)&dst, sizeof(dst));
     }
 }
 
@@ -537,6 +601,27 @@ static AudioDeviceID FindEsp32UsbAudioDeviceID(void) {
     return foundID;
 }
 
+static inline void WriteStereoFrameToBufferList(AudioBufferList *ioData, UInt32 frameIdx, float sample) {
+    if (ioData->mNumberBuffers == 1 && ioData->mBuffers[0].mNumberChannels == 2) {
+        float *out = (float *)ioData->mBuffers[0].mData;
+        if (out) {
+            out[frameIdx * 2]     = sample;
+            out[frameIdx * 2 + 1] = sample;
+        }
+    } else if (ioData->mNumberBuffers >= 2) {
+        float *outL = (float *)ioData->mBuffers[0].mData;
+        float *outR = (float *)ioData->mBuffers[1].mData;
+        if (outL) outL[frameIdx] = sample;
+        if (outR) outR[frameIdx] = sample;
+    } else if (ioData->mBuffers[0].mData) {
+        float *out = (float *)ioData->mBuffers[0].mData;
+        UInt32 ch = ioData->mBuffers[0].mNumberChannels;
+        for (UInt32 c = 0; c < ch; c++) {
+            out[frameIdx * ch + c] = sample;
+        }
+    }
+}
+
 static OSStatus BlackHoleRenderCallback(void *inRefCon,
                                         AudioUnitRenderActionFlags *ioActionFlags,
                                         const AudioTimeStamp *inTimeStamp,
@@ -553,6 +638,7 @@ static OSStatus BlackHoleRenderCallback(void *inRefCon,
     }
 
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    atomic_store_explicit(&g_lastBlackHoleRenderTime, now, memory_order_relaxed);
     CFAbsoluteTime lastAudio = atomic_load_explicit(&g_lastAudioPktTime, memory_order_relaxed);
     uint32_t w = atomic_load_explicit(&g_pcmWriteIdx, memory_order_acquire);
     uint32_t r = atomic_load_explicit(&g_pcmReadIdx, memory_order_relaxed);
@@ -561,60 +647,139 @@ static OSStatus BlackHoleRenderCallback(void *inRefCon,
     if (avail > PCM_MAX_LATENCY_SAMPLES) {
         r = w - PCM_TARGET_LATENCY_SAMPLES;
         avail = PCM_TARGET_LATENCY_SAMPLES;
+        g_readFrac = 0.0;
         atomic_store_explicit(&g_pcmReadIdx, r, memory_order_release);
+        atomic_fetch_add_explicit(&g_bhOverruns, 1, memory_order_relaxed);
     }
 
     BOOL streamRecent = (lastAudio > 0.0 && (now - lastAudio) < 0.5);
     if (!streamRecent) {
         g_pcmPrebuffering = YES;
+        g_readFrac = 0.0;
     } else if (g_pcmPrebuffering) {
-        uint32_t minStart = (inNumberFrames > PCM_PREBUFFER_SAMPLES) ? inNumberFrames : PCM_PREBUFFER_SAMPLES;
+        uint32_t minStart = (inNumberFrames + 16U > PCM_PREBUFFER_SAMPLES) ? (inNumberFrames + 16U) : PCM_PREBUFFER_SAMPLES;
         if (avail >= minStart) {
             g_pcmPrebuffering = NO;
+            g_readFrac = 0.0;
         }
-    } else if (avail < inNumberFrames) {
+    } else if (avail == 0) {
         g_pcmPrebuffering = YES;
+        g_readFrac = 0.0;
+        atomic_fetch_add_explicit(&g_bhUnderruns, 1, memory_order_relaxed);
     }
 
-    if (!streamRecent || g_pcmPrebuffering || avail < inNumberFrames) {
-        for (UInt32 b = 0; b < ioData->mNumberBuffers; b++) {
-            if (ioData->mBuffers[b].mData && ioData->mBuffers[b].mDataByteSize > 0) {
-                memset(ioData->mBuffers[b].mData, 0, ioData->mBuffers[b].mDataByteSize);
+    if (!streamRecent || g_pcmPrebuffering || avail == 0) {
+        for (UInt32 i = 0; i < inNumberFrames; i++) {
+            g_lastRenderedSample *= 0.990f;
+            if (fabsf(g_lastRenderedSample) < 1e-6f) {
+                g_lastRenderedSample = 0.0f;
             }
+            WriteStereoFrameToBufferList(ioData, i, g_lastRenderedSample);
         }
         return noErr;
     }
 
-    if (ioData->mNumberBuffers == 1 && ioData->mBuffers[0].mNumberChannels == 2) {
-        float *out = (float *)ioData->mBuffers[0].mData;
-        for (UInt32 i = 0; i < inNumberFrames; i++) {
-            int16_t pcm = g_pcmRingBuf[(r + i) & PCM_RING_MASK];
-            float s = (float)pcm / 32768.0f;
-            out[i * 2]     = s;
-            out[i * 2 + 1] = s;
-        }
-    } else if (ioData->mNumberBuffers >= 2) {
-        float *outL = (float *)ioData->mBuffers[0].mData;
-        float *outR = (float *)ioData->mBuffers[1].mData;
-        for (UInt32 i = 0; i < inNumberFrames; i++) {
-            int16_t pcm = g_pcmRingBuf[(r + i) & PCM_RING_MASK];
-            float s = (float)pcm / 32768.0f;
-            if (outL) outL[i] = s;
-            if (outR) outR[i] = s;
-        }
-    } else {
-        float *out = (float *)ioData->mBuffers[0].mData;
-        UInt32 ch = ioData->mBuffers[0].mNumberChannels;
-        for (UInt32 i = 0; i < inNumberFrames; i++) {
-            int16_t pcm = g_pcmRingBuf[(r + i) & PCM_RING_MASK];
-            float s = (float)pcm / 32768.0f;
-            for (UInt32 c = 0; c < ch; c++) {
-                out[i * ch + c] = s;
-            }
-        }
+    /* Proportional drift rate locking ring buffer fill to PCM_TARGET_LATENCY_SAMPLES (80ms) */
+    double err = (double)avail - (double)PCM_TARGET_LATENCY_SAMPLES;
+    double drift = err * 0.0000008;
+    if (drift > 0.003) drift = 0.003;
+    if (drift < -0.003) drift = -0.003;
+    double rate = 1.0 + drift;
+    if (avail < inNumberFrames + 128U) {
+        double maxRate = (avail > 2U) ? (((double)(avail - 2U) - g_readFrac) / (double)inNumberFrames) : 0.0;
+        if (maxRate < 0.0) maxRate = 0.0;
+        if (rate > maxRate) rate = maxRate;
     }
 
-    atomic_store_explicit(&g_pcmReadIdx, r + inNumberFrames, memory_order_release);
+    double pos = g_readFrac;
+    float frameOutPeak = 0.0f;
+
+    /* Biquad coefficients:
+     * Stage 1: 2nd-Order Butterworth HPF @ fc = 125 Hz, fs = 48000 Hz
+     * Stage 2: 2nd-Order Butterworth LPF @ fc = 7200 Hz, fs = 48000 Hz
+     */
+    const float hpfB0 =  0.988512f, hpfB1 = -1.977024f, hpfB2 =  0.988512f;
+    const float hpfA1 = -1.976892f, hpfA2 =  0.977156f;
+    const float lpfB0 =  0.145324f, lpfB1 =  0.290648f, lpfB2 =  0.145324f;
+    const float lpfA1 = -0.671029f, lpfA2 =  0.252325f;
+
+    for (UInt32 i = 0; i < inNumberFrames; i++) {
+        uint32_t idx = (uint32_t)pos;
+        if (idx >= avail) {
+            idx = avail - 1U;
+        }
+        uint32_t idxNext = (idx + 1U < avail) ? (idx + 1U) : idx;
+        double frac = pos - (double)idx;
+        if (frac < 0.0) frac = 0.0;
+        if (frac > 1.0) frac = 1.0;
+
+        float s0 = (float)g_pcmRingBuf[(r + idx) & PCM_RING_MASK] / 32768.0f;
+        float s1 = (float)g_pcmRingBuf[(r + idxNext) & PCM_RING_MASK] / 32768.0f;
+        float x = s0 + (float)frac * (s1 - s0);
+        pos += rate;
+
+        /* Stage 1: 1-pole DC Blocker + 2nd-Order Butterworth HPF @ 125 Hz (removes 50/60 Hz & 100 Hz Wi-Fi TX hum) */
+        float dcOut = x - g_dcPrevX + 0.995f * g_dcPrevY;
+        g_dcPrevX = x;
+        g_dcPrevY = dcOut;
+
+        float hpfOut = hpfB0 * dcOut + hpfB1 * g_hpfX1 + hpfB2 * g_hpfX2
+                     - hpfA1 * g_hpfY1 - hpfA2 * g_hpfY2;
+        g_hpfX2 = g_hpfX1;
+        g_hpfX1 = dcOut;
+        g_hpfY2 = g_hpfY1;
+        g_hpfY1 = hpfOut;
+
+        /* Stage 2: 2nd-Order Butterworth LPF @ 7200 Hz (removes >7.5 kHz ADC/RF switching hiss) */
+        float y = lpfB0 * hpfOut + lpfB1 * g_lpfX1 + lpfB2 * g_lpfX2
+                - lpfA1 * g_lpfY1 - lpfA2 * g_lpfY2;
+        g_lpfX2 = g_lpfX1;
+        g_lpfX1 = hpfOut;
+        g_lpfY2 = g_lpfY1;
+        g_lpfY1 = y;
+
+        /* Stage 3: Smooth Envelope Downward Expander (Noise Gate) + Far-Field Voice AGC */
+        float absVal = fabsf(y);
+        float coeff = (absVal > g_envLevel) ? 0.015f : 0.00025f;
+        g_envLevel += coeff * (absVal - g_envLevel);
+
+        float targetGain;
+        if (g_envLevel < 0.0022f) {
+            /* Silent room floor: attenuate background hiss down to 0.08x (-22 dB) */
+            float t = g_envLevel / 0.0022f;
+            targetGain = 0.08f + 0.92f * (t * t);
+        } else {
+            /* Active speech: +21.5 dB (12.0x) far-field boost with smooth 2:1 AGC compression on loud peaks */
+            float speechNorm = (g_envLevel - 0.0022f) / 0.0030f;
+            if (speechNorm > 1.0f) speechNorm = 1.0f;
+            float agcBoost = 1.0f + 11.0f * speechNorm; /* ramps smoothly from 1.0x to 12.0x */
+            float agcComp = 1.0f / sqrtf(1.0f + g_envLevel * 20.0f);
+            targetGain = agcBoost * agcComp;
+        }
+        g_gateGainSmooth += 0.003f * (targetGain - g_gateGainSmooth);
+
+        /* Stage 4: Apply smoothed AGC/Gate Gain + Soft-Knee tanhf Limiter */
+        float boosted = y * g_gateGainSmooth;
+        float outSample = 0.95f * tanhf(boosted / 0.95f);
+        g_lastRenderedSample = outSample;
+
+        float absOut = fabsf(outSample);
+        if (absOut > frameOutPeak) {
+            frameOutPeak = absOut;
+        }
+        WriteStereoFrameToBufferList(ioData, i, outSample);
+    }
+
+    float prevOutPeak = atomic_load_explicit(&g_pcmOutPeak, memory_order_relaxed);
+    float nextOutPeak = fmaxf(frameOutPeak, prevOutPeak * 0.985f);
+    atomic_store_explicit(&g_pcmOutPeak, nextOutPeak, memory_order_relaxed);
+
+    uint32_t consumed = (uint32_t)pos;
+    if (consumed > avail) {
+        consumed = avail;
+    }
+    g_readFrac = pos - (double)consumed;
+    atomic_store_explicit(&g_pcmReadIdx, r + consumed, memory_order_release);
     return noErr;
 }
 
@@ -638,6 +803,31 @@ static BOOL StartBlackHoleAudioBridge(void) {
     if (AudioObjectGetPropertyData(bhID, &rateAddr, 0, NULL, &rateSize, &nominalRate) == noErr && nominalRate != 48000.0) {
         Float64 targetRate = 48000.0;
         AudioObjectSetPropertyData(bhID, &rateAddr, 0, NULL, sizeof(Float64), &targetRate);
+    }
+
+    /* Force BlackHole 2ch Input & Output volume scalars to 1.0 (100%) and unmute */
+    AudioObjectPropertyScope scopes[2] = { kAudioObjectPropertyScopeInput, kAudioObjectPropertyScopeOutput };
+    for (int s = 0; s < 2; s++) {
+        for (UInt32 elem = 0; elem <= 2; elem++) {
+            AudioObjectPropertyAddress volAddr = {
+                kAudioDevicePropertyVolumeScalar,
+                scopes[s],
+                elem
+            };
+            if (AudioObjectHasProperty(bhID, &volAddr)) {
+                Float32 vol = 1.0f;
+                AudioObjectSetPropertyData(bhID, &volAddr, 0, NULL, sizeof(Float32), &vol);
+            }
+            AudioObjectPropertyAddress muteAddr = {
+                kAudioDevicePropertyMute,
+                scopes[s],
+                elem
+            };
+            if (AudioObjectHasProperty(bhID, &muteAddr)) {
+                UInt32 mute = 0;
+                AudioObjectSetPropertyData(bhID, &muteAddr, 0, NULL, sizeof(UInt32), &mute);
+            }
+        }
     }
 
     AudioComponentDescription desc = {
@@ -696,14 +886,19 @@ static BOOL StartBlackHoleAudioBridge(void) {
         AudioComponentInstanceDispose(au);
         return NO;
     }
+
+    g_blackHoleAudioUnit = au;
+    atomic_store_explicit(&g_lastBlackHoleRenderTime, CFAbsoluteTimeGetCurrent(), memory_order_relaxed);
+    atomic_store_explicit(&g_blackHoleBridgeActive, true, memory_order_release);
+
     if (AudioOutputUnitStart(au) != noErr) {
+        atomic_store_explicit(&g_blackHoleBridgeActive, false, memory_order_release);
+        g_blackHoleAudioUnit = NULL;
         AudioUnitUninitialize(au);
         AudioComponentInstanceDispose(au);
         return NO;
     }
 
-    g_blackHoleAudioUnit = au;
-    atomic_store_explicit(&g_blackHoleBridgeActive, true, memory_order_release);
     LogMsg(@"AUDIO BRIDGE: CoreAudio HALOutput 48kHz Stereo Float32 bound to 'BlackHole 2ch' (AudioDeviceID=%u)", (unsigned int)bhID);
     return YES;
 }
@@ -835,7 +1030,7 @@ static void UpdateDefaultAudioInputDevice(BOOL usbMic, BOOL wirelessMic) {
 
 /* High-Priority GCD UDP 48kHz Audio & Heartbeat Listener (Port 18796) */
 static BOOL StartUdpListener(void) {
-    if (g_udpSock >= 0) {
+    if (atomic_load_explicit(&g_udpSock, memory_order_relaxed) >= 0) {
         return YES;
     }
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -867,13 +1062,15 @@ static BOOL StartUdpListener(void) {
         return NO;
     }
 
-    g_udpSock = sock;
+    atomic_store_explicit(&g_udpSock, sock, memory_order_release);
     dispatch_queue_attr_t qAttr = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0);
     g_udpQueue = dispatch_queue_create("com.waveshare.esp32-smart-dummy.udp", qAttr);
-    g_udpReadSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, (uintptr_t)g_udpSock, 0, g_udpQueue);
+    g_udpReadSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, (uintptr_t)sock, 0, g_udpQueue);
     if (!g_udpReadSource) {
-        close(g_udpSock);
-        g_udpSock = -1;
+        int oldSock = atomic_exchange_explicit(&g_udpSock, -1, memory_order_acq_rel);
+        if (oldSock >= 0) {
+            close(oldSock);
+        }
         return NO;
     }
 
@@ -881,10 +1078,14 @@ static BOOL StartUdpListener(void) {
         uint8_t pktBuf[2048];
         struct sockaddr_in senderAddr;
         socklen_t senderLen = sizeof(senderAddr);
+        int sockFd = atomic_load_explicit(&g_udpSock, memory_order_relaxed);
+        if (sockFd < 0) {
+            return;
+        }
 
         while (1) {
             senderLen = sizeof(senderAddr);
-            ssize_t n = recvfrom(g_udpSock, pktBuf, sizeof(pktBuf), 0, (struct sockaddr *)&senderAddr, &senderLen);
+            ssize_t n = recvfrom(sockFd, pktBuf, sizeof(pktBuf), 0, (struct sockaddr *)&senderAddr, &senderLen);
             if (n < 0) {
                 break;
             }
@@ -911,12 +1112,7 @@ static BOOL StartUdpListener(void) {
             }
 
             if (!wasWirelessPresent) {
-                WriteDaemonStateFile();
-                g_lastStateWriteFromUdp = now;
                 ScheduleEvaluation(@"WirelessConnect", 10);
-            } else if ((now - g_lastStateWriteFromUdp) >= 0.5) {
-                WriteDaemonStateFile();
-                g_lastStateWriteFromUdp = now;
             }
 
             if (hdr->pkt_type == ESP32_PKT_HEARTBEAT || (now - g_lastUdpAckTime) >= 1.0) {
@@ -924,27 +1120,63 @@ static BOOL StartUdpListener(void) {
                     .magic = ESP32_UDP_MAGIC,
                     .pkt_type = ESP32_PKT_MAC_ACK_CTRL,
                     .flags = 0,
-                    .sample_cnt = 0,
+                    .sample_cnt = 100,
                     .seq = hdr->seq
                 };
-                sendto(g_udpSock, &ack, sizeof(ack), 0, (const struct sockaddr *)&senderAddr, senderLen);
+                sendto(sockFd, &ack, sizeof(ack), 0, (const struct sockaddr *)&senderAddr, senderLen);
                 g_lastUdpAckTime = now;
             }
 
-            if (hdr->pkt_type == ESP32_PKT_AUDIO_PCM16 && hdr->sample_cnt > 0) {
+            if (hdr->pkt_type == ESP32_PKT_HEARTBEAT) {
+                g_lastUdpSeq = hdr->seq;
+                g_hasLastUdpSeq = YES;
+            } else if (hdr->pkt_type == ESP32_PKT_AUDIO_PCM16 && hdr->sample_cnt > 0) {
                 size_t expectedBytes = sizeof(esp32_udp_hdr_t) + (size_t)hdr->sample_cnt * sizeof(int16_t);
                 if ((size_t)n >= expectedBytes) {
                     const int16_t *samples = (const int16_t *)(pktBuf + sizeof(esp32_udp_hdr_t));
                     BOOL isMuted = ((hdr->flags & 0x01) != 0);
                     uint32_t cnt = hdr->sample_cnt;
                     uint32_t w = atomic_load_explicit(&g_pcmWriteIdx, memory_order_relaxed);
-                    for (uint32_t i = 0; i < cnt; i++) {
-                        g_pcmRingBuf[(w + i) & PCM_RING_MASK] = isMuted ? 0 : samples[i];
+                    uint32_t r = atomic_load_explicit(&g_pcmReadIdx, memory_order_acquire);
+
+                    if (g_hasLastUdpSeq) {
+                        int32_t seqDiff = (int32_t)(hdr->seq - g_lastUdpSeq);
+                        if (seqDiff > 1) {
+                            atomic_fetch_add_explicit(&g_udpSeqDrops, (uint64_t)(seqDiff - 1), memory_order_relaxed);
+                            if (seqDiff <= 8 && (uint32_t)(w - r) + 480U + cnt < PCM_MAX_LATENCY_SAMPLES) {
+                                int16_t startVal = g_lastUdpPcmSample;
+                                int16_t endVal = isMuted ? 0 : samples[0];
+                                for (uint32_t k = 0; k < 480U; k++) {
+                                    float alpha = (float)(k + 1U) / 481.0f;
+                                    int16_t interp = (int16_t)((float)startVal + alpha * (float)(endVal - startVal));
+                                    g_pcmRingBuf[(w + k) & PCM_RING_MASK] = interp;
+                                }
+                                w += 480U;
+                            }
+                        }
                     }
+                    g_lastUdpSeq = hdr->seq;
+                    g_hasLastUdpSeq = YES;
+
+                    int16_t maxAbs = 0;
+                    for (uint32_t i = 0; i < cnt; i++) {
+                        int16_t s = isMuted ? 0 : samples[i];
+                        g_pcmRingBuf[(w + i) & PCM_RING_MASK] = s;
+                        int16_t a = (s == -32768) ? 32767 : (s < 0 ? -s : s);
+                        if (a > maxAbs) {
+                            maxAbs = a;
+                        }
+                    }
+                    g_lastUdpPcmSample = isMuted ? 0 : samples[cnt - 1U];
                     w += cnt;
                     atomic_store_explicit(&g_pcmWriteIdx, w, memory_order_release);
+
+                    float pktRawPeak = (float)maxAbs / 32768.0f;
+                    float prevRawPeak = atomic_load_explicit(&g_pcmRawPeak, memory_order_relaxed);
+                    float nextRawPeak = fmaxf(pktRawPeak, prevRawPeak * 0.985f);
+                    atomic_store_explicit(&g_pcmRawPeak, nextRawPeak, memory_order_relaxed);
+
                     if (!atomic_load_explicit(&g_blackHoleBridgeActive, memory_order_relaxed)) {
-                        uint32_t r = atomic_load_explicit(&g_pcmReadIdx, memory_order_relaxed);
                         if ((uint32_t)(w - r) > PCM_MAX_LATENCY_SAMPLES) {
                             atomic_store_explicit(&g_pcmReadIdx, w - PCM_TARGET_LATENCY_SAMPLES, memory_order_release);
                         }
@@ -956,9 +1188,9 @@ static BOOL StartUdpListener(void) {
     });
 
     dispatch_source_set_cancel_handler(g_udpReadSource, ^{
-        if (g_udpSock >= 0) {
-            close(g_udpSock);
-            g_udpSock = -1;
+        int oldSock = atomic_exchange_explicit(&g_udpSock, -1, memory_order_acq_rel);
+        if (oldSock >= 0) {
+            close(oldSock);
         }
     });
 
@@ -971,9 +1203,11 @@ static void StopUdpListener(void) {
     if (g_udpReadSource) {
         dispatch_source_cancel(g_udpReadSource);
         g_udpReadSource = nil;
-    } else if (g_udpSock >= 0) {
-        close(g_udpSock);
-        g_udpSock = -1;
+    } else {
+        int oldSock = atomic_exchange_explicit(&g_udpSock, -1, memory_order_acq_rel);
+        if (oldSock >= 0) {
+            close(oldSock);
+        }
     }
 }
 
@@ -987,6 +1221,24 @@ static BOOL IsOnACPower(void) {
     BOOL ac = (type && CFEqual(type, CFSTR(kIOPMACPowerKey)));
     CFRelease(blob);
     return ac;
+}
+
+/* Query IOPMrootDomain for AppleClamshellState (YES when MacBook lid is closed) */
+static BOOL IsClamshellClosed(void) {
+    io_registry_entry_t rootDomain = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"));
+    if (rootDomain == IO_OBJECT_NULL) {
+        return NO;
+    }
+    CFTypeRef prop = IORegistryEntryCreateCFProperty(rootDomain, CFSTR("AppleClamshellState"), kCFAllocatorDefault, 0);
+    BOOL closed = NO;
+    if (prop) {
+        if (CFGetTypeID(prop) == CFBooleanGetTypeID()) {
+            closed = (BOOL)CFBooleanGetValue((CFBooleanRef)prop);
+        }
+        CFRelease(prop);
+    }
+    IOObjectRelease(rootDomain);
+    return closed;
 }
 
 /* Query Apple Silicon DCP kernel driver (IOMobileFramebuffer) for connected physical external monitors */
@@ -1070,7 +1322,7 @@ static BOOL CountRealExternalDisplays(uint32_t *outRealExtCount,
 
     uint32_t kernelExt = 0;
     uint32_t realExt = cgRealExt;
-    if (CountKernelExternalDisplays(&kernelExt)) {
+    if (CountKernelExternalDisplays(&kernelExt) && kernelExt > cgRealExt) {
         realExt = kernelExt;
     }
 
@@ -1084,7 +1336,7 @@ static BOOL CountRealExternalDisplays(uint32_t *outRealExtCount,
 static void SetRootDomainClamshellSleepDisabled(BOOL disableSleep) {
     for (int attempt = 0; attempt < 2; attempt++) {
         if (g_rootDomainConn == IO_OBJECT_NULL) {
-            io_service_t rootDomain = IOPMFindPowerManagement(kIOMainPortDefault);
+            io_service_t rootDomain = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"));
             if (rootDomain != IO_OBJECT_NULL) {
                 IOServiceOpen(rootDomain, mach_task_self(), 0, &g_rootDomainConn);
                 IOObjectRelease(rootDomain);
@@ -1112,11 +1364,12 @@ static void SetRootDomainClamshellSleepDisabled(BOOL disableSleep) {
 static void TickleDisplayWake(BOOL force) {
     static CFAbsoluteTime lastTickleTime = 0;
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    if (force || g_userTickleAssertion == kIOPMNullAssertionID || (now - lastTickleTime) >= 30.0) {
+    if (force || g_userTickleAssertion == kIOPMNullAssertionID || (now - lastTickleTime) >= 4.0) {
         IOReturn rc = IOPMAssertionDeclareUserActivity(CFSTR("ESP32 Smart Dummy Clamshell Display Wake"),
                                                        kIOPMUserActiveLocal,
                                                        &g_userTickleAssertion);
         if (rc != kIOReturnSuccess && g_userTickleAssertion != kIOPMNullAssertionID) {
+            IOPMAssertionRelease(g_userTickleAssertion);
             g_userTickleAssertion = kIOPMNullAssertionID;
             rc = IOPMAssertionDeclareUserActivity(CFSTR("ESP32 Smart Dummy Clamshell Display Wake"),
                                                   kIOPMUserActiveLocal,
@@ -1128,9 +1381,17 @@ static void TickleDisplayWake(BOOL force) {
     }
 }
 
-/* Acquire Clamshell-proof powerd assertions (with SensorsActive=YES so powerd EvaluateClamshell counts them on lid-closed unplug) */
-static void AcquireStayAwakeAssertions(BOOL forceTickle) {
+/* Acquire Clamshell-proof powerd assertions:
+ * - Always hold PreventUserIdleSystemSleep (SensorsActive=YES) + ClamshellSleepDisabled=1 so unplugging the last
+ *   monitor or closing the lid is pre-protected before powerd runs EvaluateClamshell.
+ * - Only hold PreventUserIdleDisplaySleep / UserIsActive / TickleDisplayWake when isHeadless == YES (0 physical displays
+ *   active), so physical monitors and the built-in LCD can enter normal idle display sleep / screen saver when open.
+ */
+static void AcquireStayAwakeAssertions(BOOL forceTickle, BOOL isHeadless) {
     BOOL newlyArmed = !g_clamshellStayAwakeActive;
+    BOOL becameHeadless = (isHeadless && !g_lastHeadlessAssertionState);
+    g_lastHeadlessAssertionState = isHeadless;
+
     if (g_sysSleepAssertion == kIOPMNullAssertionID) {
         NSDictionary *sysProps = @{
             (__bridge NSString *)kIOPMAssertionTypeKey: (__bridge NSString *)kIOPMAssertionTypePreventUserIdleSystemSleep,
@@ -1140,32 +1401,50 @@ static void AcquireStayAwakeAssertions(BOOL forceTickle) {
         };
         IOPMAssertionCreateWithProperties((__bridge CFDictionaryRef)sysProps, &g_sysSleepAssertion);
     }
-    if (g_dispSleepAssertion == kIOPMNullAssertionID) {
-        NSDictionary *dispProps = @{
-            (__bridge NSString *)kIOPMAssertionTypeKey: (__bridge NSString *)kIOPMAssertionTypePreventUserIdleDisplaySleep,
-            (__bridge NSString *)kIOPMAssertionNameKey: @"ESP32 Smart Dummy Display Keep-Alive",
-            (__bridge NSString *)kIOPMAssertionLevelKey: @(kIOPMAssertionLevelOn),
-            @"SensorsActive": @YES,
-        };
-        IOPMAssertionCreateWithProperties((__bridge CFDictionaryRef)dispProps, &g_dispSleepAssertion);
-    }
-    if (g_userActAssertion == kIOPMNullAssertionID) {
-        NSDictionary *userProps = @{
-            (__bridge NSString *)kIOPMAssertionTypeKey: @"UserIsActive",
-            (__bridge NSString *)kIOPMAssertionNameKey: @"ESP32 Smart Dummy Clamshell UserActive",
-            (__bridge NSString *)kIOPMAssertionLevelKey: @(kIOPMAssertionLevelOn),
-            @"SensorsActive": @YES,
-        };
-        IOPMAssertionCreateWithProperties((__bridge CFDictionaryRef)userProps, &g_userActAssertion);
-    }
+
     SetRootDomainClamshellSleepDisabled(YES);
-    TickleDisplayWake(forceTickle || newlyArmed);
     g_clamshellStayAwakeActive = YES;
+
+    if (isHeadless) {
+        if (g_dispSleepAssertion == kIOPMNullAssertionID) {
+            NSDictionary *dispProps = @{
+                (__bridge NSString *)kIOPMAssertionTypeKey: (__bridge NSString *)kIOPMAssertionTypePreventUserIdleDisplaySleep,
+                (__bridge NSString *)kIOPMAssertionNameKey: @"ESP32 Smart Dummy Display Keep-Alive",
+                (__bridge NSString *)kIOPMAssertionLevelKey: @(kIOPMAssertionLevelOn),
+                @"SensorsActive": @YES,
+            };
+            IOPMAssertionCreateWithProperties((__bridge CFDictionaryRef)dispProps, &g_dispSleepAssertion);
+        }
+        if (g_userActAssertion == kIOPMNullAssertionID) {
+            NSDictionary *userProps = @{
+                (__bridge NSString *)kIOPMAssertionTypeKey: @"UserIsActive",
+                (__bridge NSString *)kIOPMAssertionNameKey: @"ESP32 Smart Dummy Clamshell UserActive",
+                (__bridge NSString *)kIOPMAssertionLevelKey: @(kIOPMAssertionLevelOn),
+                @"SensorsActive": @YES,
+            };
+            IOPMAssertionCreateWithProperties((__bridge CFDictionaryRef)userProps, &g_userActAssertion);
+        }
+        TickleDisplayWake(forceTickle || newlyArmed || becameHeadless);
+    } else {
+        if (g_dispSleepAssertion != kIOPMNullAssertionID) {
+            IOPMAssertionRelease(g_dispSleepAssertion);
+            g_dispSleepAssertion = kIOPMNullAssertionID;
+        }
+        if (g_userActAssertion != kIOPMNullAssertionID) {
+            IOPMAssertionRelease(g_userActAssertion);
+            g_userActAssertion = kIOPMNullAssertionID;
+        }
+        if (g_userTickleAssertion != kIOPMNullAssertionID) {
+            IOPMAssertionRelease(g_userTickleAssertion);
+            g_userTickleAssertion = kIOPMNullAssertionID;
+        }
+    }
 }
 
 static void ReleaseStayAwakeAssertions(BOOL allowClamshellSleepNow) {
     BOOL wasActive = g_clamshellStayAwakeActive;
     g_clamshellStayAwakeActive = NO;
+    g_lastHeadlessAssertionState = NO;
     if (g_sysSleepAssertion != kIOPMNullAssertionID) {
         IOPMAssertionRelease(g_sysSleepAssertion);
         g_sysSleepAssertion = kIOPMNullAssertionID;
@@ -1231,6 +1510,19 @@ static void EnsureHiDPIMode1600x1000(CGDirectDisplayID dummyID) {
     unsigned int targetH = g_targetHeight;
     unsigned int backingW = targetW * 2;
     unsigned int backingH = targetH * 2;
+
+    CGDisplayModeRef cur = CGDisplayCopyDisplayMode(dummyID);
+    if (cur) {
+        BOOL alreadySet = (CGDisplayModeGetWidth(cur) == targetW &&
+                           CGDisplayModeGetHeight(cur) == targetH &&
+                           CGDisplayModeGetPixelWidth(cur) == backingW &&
+                           CGDisplayModeGetPixelHeight(cur) == backingH);
+        CGDisplayModeRelease(cur);
+        if (alreadySet) {
+            return;
+        }
+    }
+
     NSDictionary *opts = @{ (__bridge NSString *)kCGDisplayShowDuplicateLowResolutionModes: @YES };
     CFArrayRef modes = CGDisplayCopyAllDisplayModes(dummyID, (__bridge CFDictionaryRef)opts);
     if (!modes) {
@@ -1250,23 +1542,12 @@ static void EnsureHiDPIMode1600x1000(CGDirectDisplayID dummyID) {
         }
     }
     if (bestMode) {
-        CGDisplayModeRef cur = CGDisplayCopyDisplayMode(dummyID);
-        BOOL alreadySet = (cur &&
-                           CGDisplayModeGetWidth(cur) == targetW &&
-                           CGDisplayModeGetHeight(cur) == targetH &&
-                           CGDisplayModeGetPixelWidth(cur) == backingW &&
-                           CGDisplayModeGetPixelHeight(cur) == backingH);
-        if (cur) {
-            CGDisplayModeRelease(cur);
-        }
-        if (!alreadySet) {
-            CGDisplayConfigRef configRef = NULL;
-            if (CGBeginDisplayConfiguration(&configRef) == kCGErrorSuccess) {
-                if (CGConfigureDisplayWithDisplayMode(configRef, dummyID, bestMode, NULL) == kCGErrorSuccess) {
-                    CGCompleteDisplayConfiguration(configRef, kCGConfigurePermanently);
-                } else {
-                    CGCancelDisplayConfiguration(configRef);
-                }
+        CGDisplayConfigRef configRef = NULL;
+        if (CGBeginDisplayConfiguration(&configRef) == kCGErrorSuccess) {
+            if (CGConfigureDisplayWithDisplayMode(configRef, dummyID, bestMode, NULL) == kCGErrorSuccess) {
+                CGCompleteDisplayConfiguration(configRef, kCGConfigurePermanently);
+            } else {
+                CGCancelDisplayConfiguration(configRef);
             }
         }
     }
@@ -1308,15 +1589,14 @@ static void CreateDummyDisplay(void) {
         desc.queue = vdisplayQueue;
     }
     desc.terminationHandler = ^(id a, id b) {
-        (void)a;
         (void)b;
         dispatch_async(dispatch_get_main_queue(), ^{
             @autoreleasepool {
-                if (g_virtualDisplay != nil) {
+                if (g_virtualDisplay != nil && (id)g_virtualDisplay == a) {
                     LogMsg(@"WARNING: CGVirtualDisplay terminationHandler fired — scheduling immediate remount");
                     g_virtualDisplay = nil;
                     g_dummyCreatedAt = 0;
-                    EvaluateState(@"VirtualDisplayTerminated");
+                    ScheduleEvaluation(@"VirtualDisplayTerminated", 500);
                 }
             }
         });
@@ -1344,7 +1624,7 @@ static void CreateDummyDisplay(void) {
     g_dummyCreatedAt = CFAbsoluteTimeGetCurrent();
     EnsureNotMirrored(g_virtualDisplay.displayID);
     EnsureHiDPIMode1600x1000(g_virtualDisplay.displayID);
-    AcquireStayAwakeAssertions(YES);
+    AcquireStayAwakeAssertions(YES, YES);
 
     /* Ensure powerd & WindowServer register display activity and HiDPI mode after virtual screen attaches */
     CGVirtualDisplay *createdDisplay = display;
@@ -1375,55 +1655,88 @@ static void DestroyDummyDisplay(NSString *reason) {
 
 static void EvaluateState(NSString *trigger) {
     @autoreleasepool {
+        CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+
+        /* 1. Periodic 5 MB log file rotation check (every 60s) */
+        static CFAbsoluteTime s_lastLogCheckTime = 0.0;
+        if ((now - s_lastLogCheckTime) >= 60.0) {
+            s_lastLogCheckTime = now;
+            struct stat st;
+            if (stat("/tmp/esp32-smart-dummy.log", &st) == 0 && st.st_size > 5 * 1024 * 1024) {
+                truncate("/tmp/esp32-smart-dummy.log", 0);
+                LogMsg(@"Rotated /tmp/esp32-smart-dummy.log (exceeded 5 MB)");
+            }
+        }
+
         uint32_t realExtCount = 0;
         uint32_t builtinCount = 0;
         uint32_t dummyCount = 0;
         if (!CountRealExternalDisplays(&realExtCount, &builtinCount, &dummyCount)) {
             return;
         }
+        BOOL clamshellClosed = IsClamshellClosed();
         if (g_simulateZeroRealMonitors) {
             realExtCount = 0;
+            builtinCount = 0;
+            clamshellClosed = YES;
         }
+        BOOL isHeadless = (realExtCount == 0 && (clamshellClosed || builtinCount == 0));
+
         BOOL usbMicPresent = IsEsp32MicPresent();
         BOOL wirelessMicPresent = IsEsp32WirelessPresent();
-        BOOL wirelessHoldPresent = IsEsp32WirelessHoldActive(realExtCount == 0);
+        BOOL wirelessHoldPresent = IsEsp32WirelessHoldActive(isHeadless);
         BOOL micPresent = (g_standaloneMode || usbMicPresent || wirelessMicPresent || wirelessHoldPresent);
         BOOL onAC = IsOnACPower();
 
+        if (!wirelessMicPresent) {
+            atomic_store_explicit(&g_pcmRawPeak, 0.0f, memory_order_relaxed);
+            atomic_store_explicit(&g_pcmOutPeak, 0.0f, memory_order_relaxed);
+        }
+
         SendActiveWirelessProbeIfNeeded();
 
-        if (!atomic_load_explicit(&g_blackHoleBridgeActive, memory_order_relaxed)) {
+        /* 2. Self-healing CoreAudio BlackHole 2ch bridge & coreaudiod restart watchdog */
+        if (atomic_load_explicit(&g_blackHoleBridgeActive, memory_order_relaxed)) {
+            double lastRender = atomic_load_explicit(&g_lastBlackHoleRenderTime, memory_order_relaxed);
+            if (lastRender > 0.0 && (now - lastRender) > 3.0) {
+                LogMsg(@"WARNING: BlackHole render callback stalled for %.1fs (coreaudiod restart?) — reinitializing audio bridge",
+                       now - lastRender);
+                StopBlackHoleAudioBridge();
+                StartBlackHoleAudioBridge();
+            }
+        } else {
             StartBlackHoleAudioBridge();
         }
         UpdateDefaultAudioInputDevice(usbMicPresent, wirelessMicPresent);
         WriteDaemonStateFile();
 
         if (g_forceCreateForTest) {
-            LogMsg(@"[%@] State check (TEST MODE): realExt=%u, builtin=%u, micPresent=%d (standalone=%d, usb=%d, wifi=%d), onAC=%d",
-                   trigger, realExtCount, builtinCount, micPresent, g_standaloneMode, usbMicPresent, wirelessMicPresent, onAC);
-            AcquireStayAwakeAssertions(YES);
+            LogMsg(@"[%@] State check (TEST MODE): realExt=%u, builtin=%u, clamshellClosed=%d, micPresent=%d (standalone=%d, usb=%d, wifi=%d), onAC=%d",
+                   trigger, realExtCount, builtinCount, clamshellClosed, micPresent, g_standaloneMode, usbMicPresent, wirelessMicPresent, onAC);
+            AcquireStayAwakeAssertions(YES, YES);
             CreateDummyDisplay();
             return;
         }
 
         /* Core Decoupled Policy:
          * A) Clamshell Stay-Awake Assertions (wantKeepAwake = micPresent && onAC):
-         *    Must be held CONTINUOUSLY whenever the ESP32 Microphone is connected (USB or Wi-Fi UDP) or standalone mode
-         *    is enabled and MacBook is on AC power, even while 1 or 2 real physical monitors are connected!
-         *    Why: When the user unplugs the last physical monitor while the lid is closed, WindowServer immediately
-         *    sets DesktopMode=0 and powerd runs EvaluateClamshell within ~300ms. Because our SensorsActive=YES
-         *    assertions are ALREADY active in powerd, EvaluateClamshell sees assertions >= 1 and keeps
-         *    ClamshellSleepDisabled=1 instead of putting the Mac into Clamshell Sleep!
+         *    - PreventUserIdleSystemSleep (SensorsActive=YES) + ClamshellSleepDisabled=1 are held CONTINUOUSLY
+         *      whenever micPresent && onAC, even when physical monitors or the open built-in LCD are active, so
+         *      unplugging the last monitor or closing the lid is pre-protected before powerd runs EvaluateClamshell.
+         *    - Display wake assertions (PreventUserIdleDisplaySleep / UserIsActive / 4s TickleDisplayWake) are ONLY
+         *      held when isHeadless == YES, allowing physical monitors to sleep normally on idle.
          *
-         * B) HiDPI (2x backing) Virtual Dummy Display (wantDummy = wantKeepAwake && realExtCount == 0):
-         *    - When realExtCount >= 1: Destroy the virtual display immediately so M3 Pro's 2 external display
-         *      pipes are 100% available for real physical monitors regardless of plug order.
-         *    - When realExtCount == 0 (and micPresent && onAC): Mount the HiDPI virtual display so
-         *      UURemote / Screen Sharing has an active HiDPI framebuffer while in headless clamshell mode.
+         * B) HiDPI (2x backing) Virtual Dummy Display (wantDummy = wantKeepAwake && isHeadless):
+         *    - When !isHeadless (realExtCount >= 1 OR MacBook lid is open with built-in LCD active): Destroy the
+         *      virtual display immediately so there is never a phantom 2nd screen when the lid is open and M3 Pro's
+         *      external display pipes are 100% available for real physical monitors.
+         *    - When isHeadless (realExtCount == 0 && (clamshellClosed || builtinCount == 0)): Mount the HiDPI virtual
+         *      display so UURemote / Screen Sharing has an active HiDPI framebuffer while in headless clamshell mode.
          */
         BOOL wantKeepAwake = (micPresent && onAC);
-        BOOL wantDummy = (wantKeepAwake && realExtCount == 0);
+        BOOL wantDummy = (wantKeepAwake && isHeadless);
         BOOL stateChanged = ((int)realExtCount != g_lastRealExtCount ||
+                             (int)clamshellClosed != g_lastClamshellClosed ||
                              (int)micPresent != g_lastMicPresent ||
                              (int)usbMicPresent != g_lastUsbMicPresent ||
                              (int)wirelessMicPresent != g_lastWifiMicPresent ||
@@ -1432,6 +1745,7 @@ static void EvaluateState(NSString *trigger) {
                              (int)wantKeepAwake != g_lastKeepAwake);
 
         g_lastRealExtCount = (int)realExtCount;
+        g_lastClamshellClosed = (int)clamshellClosed;
         g_lastMicPresent = (int)micPresent;
         g_lastUsbMicPresent = (int)usbMicPresent;
         g_lastWifiMicPresent = (int)wirelessMicPresent;
@@ -1440,24 +1754,27 @@ static void EvaluateState(NSString *trigger) {
         g_lastKeepAwake = (int)wantKeepAwake;
 
         if (wantKeepAwake) {
-            AcquireStayAwakeAssertions(NO);
-            if (realExtCount >= 1) {
+            AcquireStayAwakeAssertions(NO, isHeadless);
+            if (!isHeadless) {
+                NSString *yieldReason = (realExtCount >= 1)
+                    ? [NSString stringWithFormat:@"%u real external display(s) connected", realExtCount]
+                    : @"MacBook lid open (built-in display active)";
                 if (g_virtualDisplay != nil) {
-                    DestroyDummyDisplay([NSString stringWithFormat:@"%u real external display(s) connected", realExtCount]);
+                    DestroyDummyDisplay(yieldReason);
                 } else if (stateChanged) {
-                    LogMsg(@"[%@] Standby: %u real external display(s) online, active=YES (standalone=%d, USB=%d, WiFi=%d), AC=YES (Dummy Display OFF to yield display pipe; Clamshell Stay-Awake ARMED)",
-                           trigger, realExtCount, g_standaloneMode, usbMicPresent, wirelessMicPresent);
+                    LogMsg(@"[%@] Standby: realExt=%u, builtin=%u, clamshellClosed=%d, active=YES (standalone=%d, USB=%d, WiFi=%d), AC=YES (Dummy Display OFF: %@; Clamshell Stay-Awake ARMED)",
+                           trigger, realExtCount, builtinCount, clamshellClosed, g_standaloneMode, usbMicPresent, wirelessMicPresent, yieldReason);
                 }
             } else {
-                if (g_virtualDisplay != nil && dummyCount == 0 && (CFAbsoluteTimeGetCurrent() - g_dummyCreatedAt) > 5.0) {
+                if (g_virtualDisplay != nil && dummyCount == 0 && (now - g_dummyCreatedAt) > 5.0) {
                     LogMsg(@"[%@] WARNING: Virtual display (displayID=%u) missing from online display list after grace period -> recreating",
                            trigger, g_virtualDisplay.displayID);
                     g_virtualDisplay = nil;
                     g_dummyCreatedAt = 0;
                 }
                 if (g_virtualDisplay == nil) {
-                    LogMsg(@"[%@] 0 real external displays + active trigger (standalone=%d, USB=%d, WiFi=%d) + AC power -> Activating %ux%u HiDPI Dummy Display",
-                           trigger, g_standaloneMode, usbMicPresent, wirelessMicPresent, g_targetWidth, g_targetHeight);
+                    LogMsg(@"[%@] Headless Clamshell (realExt=0, clamshellClosed=%d) + active trigger (standalone=%d, USB=%d, WiFi=%d) + AC power -> Activating %ux%u HiDPI Dummy Display",
+                           trigger, clamshellClosed, g_standaloneMode, usbMicPresent, wirelessMicPresent, g_targetWidth, g_targetHeight);
                     CreateDummyDisplay();
                 } else {
                     EnsureNotMirrored(g_virtualDisplay.displayID);
@@ -1472,8 +1789,8 @@ static void EvaluateState(NSString *trigger) {
             /* Re-enable normal Clamshell Sleep if no real monitors are keeping DesktopMode active */
             ReleaseStayAwakeAssertions(realExtCount == 0);
             if (stateChanged) {
-                LogMsg(@"[%@] Disarmed: realExt=%u, %@ (Dummy Display OFF, Clamshell Stay-Awake OFF)",
-                       trigger, realExtCount, why);
+                LogMsg(@"[%@] Disarmed: realExt=%u, clamshellClosed=%d, %@ (Dummy Display OFF, Clamshell Stay-Awake OFF)",
+                       trigger, realExtCount, clamshellClosed, why);
             }
         }
     }
@@ -1523,9 +1840,12 @@ static void RootDomainInterestCallback(void *refcon, io_service_t service, uint3
         if (messageType == kIOPMMessageClamshellStateChange) {
             if (g_clamshellStayAwakeActive) {
                 SetRootDomainClamshellSleepDisabled(YES);
-                TickleDisplayWake(YES);
+                if (IsClamshellClosed()) {
+                    TickleDisplayWake(YES);
+                }
             }
-            ScheduleEvaluation(@"ClamshellStateChange", 20);
+            EvaluateState(@"ClamshellStateChange");
+            ScheduleEvaluation(@"ClamshellStateFollowup", 150);
         }
     }
 }
@@ -1626,15 +1946,19 @@ static void RegisterSignalHandlers(void) {
                     EvaluateState(@"SimulatePlugMonitors(SIGUSR2)");
                 } else {
                     DestroyDummyDisplay(@"Daemon shutting down");
-                    if (!IsEsp32WirelessPresent()) {
+                    BOOL wirelessStillActive = IsEsp32WirelessPresent();
+                    if (wirelessStillActive) {
+                        WriteDaemonStateFile();
+                    } else {
                         UpdateDefaultAudioInputDevice(NO, NO);
+                        unlink(STATE_FILE_PATH);
                     }
                     StopBlackHoleAudioBridge();
                     StopUdpListener();
-                    uint32_t realExt = 0;
-                    CountRealExternalDisplays(&realExt, NULL, NULL);
-                    if (realExt > 0 || !IsOnACPower()) {
-                        unlink(STATE_FILE_PATH);
+                    uint32_t realExt = 0, builtin = 0;
+                    CountRealExternalDisplays(&realExt, &builtin, NULL);
+                    BOOL isHeadlessNow = (realExt == 0 && (IsClamshellClosed() || builtin == 0));
+                    if (!isHeadlessNow || !IsOnACPower()) {
                         ReleaseStayAwakeAssertions(realExt == 0);
                     }
                     if (g_rootDomainConn != IO_OBJECT_NULL) {
@@ -1685,6 +2009,7 @@ static void PrintUsage(const char *progName) {
            "Options:\n"
            "  --status              Print current power, display, audio bridge, and daemon state and exit\n"
            "  --probe-wireless      Print wireless ESP32 UDP presence and IP address and exit\n"
+           "  --hold-awake <sec>    Hold Clamshell Stay-Awake assertions for <sec> seconds and exit\n"
            "  --standalone          Activate virtual display & stay-awake on AC power without requiring\n"
            "                        ESP32 hardware presence (default; ESP32 still acts as wireless/USB mic)\n"
            "  --require-esp32       Only activate virtual display & stay-awake when ESP32 is online\n"
@@ -1710,6 +2035,7 @@ int main(int argc, const char * argv[]) {
 
         BOOL oneShotStatus = NO;
         BOOL probeWireless = NO;
+        double holdAwakeSec = 0.0;
         for (int i = 1; i < argc; i++) {
             if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
                 PrintUsage(argv[0]);
@@ -1718,6 +2044,14 @@ int main(int argc, const char * argv[]) {
                 g_standaloneMode = YES;
             } else if (strcmp(argv[i], "--require-esp32") == 0) {
                 g_standaloneMode = NO;
+            } else if (strcmp(argv[i], "--hold-awake") == 0) {
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "Error: --hold-awake requires a <seconds> argument\n");
+                    return 1;
+                }
+                holdAwakeSec = strtod(argv[++i], NULL);
+            } else if (strncmp(argv[i], "--hold-awake=", 13) == 0) {
+                holdAwakeSec = strtod(argv[i] + 13, NULL);
             } else if (strcmp(argv[i], "--resolution") == 0) {
                 if (i + 1 >= argc) {
                     fprintf(stderr, "Error: --resolution requires a <W>x<H> argument (800..3840 x 600..2400)\n");
@@ -1749,11 +2083,20 @@ int main(int argc, const char * argv[]) {
             }
         }
 
+        if (holdAwakeSec > 0.0) {
+            if (holdAwakeSec > 30.0) {
+                holdAwakeSec = 30.0;
+            }
+            AcquireStayAwakeAssertions(YES, YES);
+            usleep((useconds_t)(holdAwakeSec * 1000000.0));
+            return 0;
+        }
+
         if (probeWireless) {
             char ipBuf[64] = "none";
             CFAbsoluteTime lastRx = 0.0;
             BOOL wifi = NO;
-            if (ReadDaemonStateFile(&lastRx, NULL, ipBuf, sizeof(ipBuf))) {
+            if (ReadDaemonStateFile(&lastRx, NULL, ipBuf, sizeof(ipBuf), NULL)) {
                 wifi = (lastRx > 0.0 && (CFAbsoluteTimeGetCurrent() - lastRx) < 5.0);
             }
             printf("ESP32_WIFI_PRESENT=%d\nESP32_IP=%s\n", wifi ? 1 : 0, ipBuf);
@@ -1763,10 +2106,12 @@ int main(int argc, const char * argv[]) {
         if (oneShotStatus) {
             uint32_t realExt = 0, builtin = 0, dummy = 0;
             CountRealExternalDisplays(&realExt, &builtin, &dummy);
+            BOOL clamshellClosed = IsClamshellClosed();
             BOOL usbMic = IsEsp32MicPresent();
             CFAbsoluteTime lastRx = 0.0;
             BOOL bhBridge = NO;
-            if (ReadDaemonStateFile(&lastRx, &bhBridge, NULL, 0)) {
+            DaemonAudioTelemetry telem = {0};
+            if (ReadDaemonStateFile(&lastRx, &bhBridge, NULL, 0, &telem)) {
                 /* State file from running daemon is valid */
             } else {
                 bhBridge = (FindBlackHoleDeviceID() != kAudioObjectUnknown);
@@ -1779,22 +2124,34 @@ int main(int argc, const char * argv[]) {
                    "ESP32_WIFI_PRESENT=%d\n"
                    "BLACKHOLE_AUDIO_BRIDGE=%d\n"
                    "AC_POWER=%d\n"
+                   "CLAMSHELL_CLOSED=%d\n"
                    "REAL_EXTERNAL_DISPLAYS=%u\n"
                    "DUMMY_DISPLAYS=%u\n"
                    "BUILTIN_DISPLAYS=%u\n"
                    "STANDALONE_MODE=%d\n"
-                   "TARGET_RESOLUTION=%ux%u\n",
+                   "TARGET_RESOLUTION=%ux%u\n"
+                   "BH_UNDERRUNS=%llu\n"
+                   "BH_OVERRUNS=%llu\n"
+                   "UDP_SEQ_DROPS=%llu\n"
+                   "PCM_RAW_PEAK=%.4f\n"
+                   "PCM_OUT_PEAK=%.4f\n",
                    mic ? 1 : 0,
                    usbMic ? 1 : 0,
                    wifiMic ? 1 : 0,
                    bhBridge ? 1 : 0,
                    ac ? 1 : 0,
+                   clamshellClosed ? 1 : 0,
                    realExt,
                    dummy,
                    builtin,
                    g_standaloneMode ? 1 : 0,
                    g_targetWidth,
-                   g_targetHeight);
+                   g_targetHeight,
+                   (unsigned long long)telem.bhUnderruns,
+                   (unsigned long long)telem.bhOverruns,
+                   (unsigned long long)telem.udpSeqDrops,
+                   (double)telem.pcmRawPeak,
+                   (double)telem.pcmOutPeak);
             return 0;
         }
 
@@ -1805,7 +2162,7 @@ int main(int argc, const char * argv[]) {
         {
             CFAbsoluteTime prevRx = 0.0;
             char prevIp[64] = {0};
-            if (ReadDaemonStateFile(&prevRx, NULL, prevIp, sizeof(prevIp))) {
+            if (ReadDaemonStateFile(&prevRx, NULL, prevIp, sizeof(prevIp), NULL)) {
                 if (prevRx > 0.0 && (CFAbsoluteTimeGetCurrent() - prevRx) < 60.0) {
                     atomic_store_explicit(&g_lastWirelessRxTime, prevRx, memory_order_relaxed);
                     if (prevIp[0] != '\0') {
@@ -1859,7 +2216,7 @@ int main(int argc, const char * argv[]) {
                 CFRelease(pidNum);
             }
 
-            io_service_t rootDomain = IOPMFindPowerManagement(kIOMainPortDefault);
+            io_service_t rootDomain = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"));
             if (rootDomain != IO_OBJECT_NULL) {
                 IOServiceAddInterestNotification(notifyPort,
                                                  rootDomain,

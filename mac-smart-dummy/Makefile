@@ -29,8 +29,9 @@ install: $(TARGET)
 	if [ -f smart-dummy.log ] && [ ! -L smart-dummy.log ]; then cat smart-dummy.log >> $(LOG_TMP) 2>/dev/null || true; rm -f smart-dummy.log; fi
 	ln -sf $(LOG_TMP) smart-dummy.log
 	sed "s|__BIN_PATH__|$(INST_BIN)|g" $(PLIST) > $(AGENT)
+	$(INST_BIN) --hold-awake 4 >/dev/null 2>&1 &
 	-launchctl bootout gui/$$(id -u)/com.waveshare.esp32-smart-dummy 2>/dev/null
-	sleep 1
+	for i in $$(seq 1 40); do launchctl print gui/$$(id -u)/com.waveshare.esp32-smart-dummy >/dev/null 2>&1 || break; sleep 0.05; done
 	launchctl bootstrap gui/$$(id -u) $(AGENT)
 
 install-standalone: $(TARGET)
@@ -41,8 +42,9 @@ install-standalone: $(TARGET)
 	if [ -f smart-dummy.log ] && [ ! -L smart-dummy.log ]; then cat smart-dummy.log >> $(LOG_TMP) 2>/dev/null || true; rm -f smart-dummy.log; fi
 	ln -sf $(LOG_TMP) smart-dummy.log
 	sed "s|<string>__BIN_PATH__</string>|<string>$(INST_BIN)</string><string>--standalone</string>|g" $(PLIST) > $(AGENT)
+	$(INST_BIN) --hold-awake 4 >/dev/null 2>&1 &
 	-launchctl bootout gui/$$(id -u)/com.waveshare.esp32-smart-dummy 2>/dev/null
-	sleep 1
+	for i in $$(seq 1 40); do launchctl print gui/$$(id -u)/com.waveshare.esp32-smart-dummy >/dev/null 2>&1 || break; sleep 0.05; done
 	launchctl bootstrap gui/$$(id -u) $(AGENT)
 
 uninstall:
